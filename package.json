@@ -1,17 +1,17 @@
 {
   "name": "line-reminder-bot",
   "version": "1.0.0",
-  "description": "LINE Bot for message reminders",
+  "description": "LINE Reminder Bot",
   "main": "app.js",
   "scripts": {
     "start": "node app.js"
-  },
-  "engines": {
-    "node": "16.x"
   },
   "dependencies": {
     "express": "^4.17.1",
     "@line/bot-sdk": "^7.5.0",
     "node-cron": "^3.0.0"
+  },
+  "engines": {
+    "node": "16.x"
   }
 }
