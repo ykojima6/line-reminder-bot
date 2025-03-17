@@ -23,9 +23,10 @@ console.log('SLACK_WEBHOOK_URL exists:', !!process.env.SLACK_WEBHOOK_URL);
 // LINEクライアントを初期化
 const client = new line.Client(config);
 
-// 会話履歴を保存する構造
-// { userId: { lastMessage: { id, text, timestamp, userName }, needsResponse: true/false } }
-const conversations = {};
+// パターンを変更: メッセージを保持する代わりに、最後の通信情報のみを保持
+// { userId: { lastTimestamp, awaitingReply } }
+// awaitingReply = false の場合、リマインドが不要
+const userStates = {};
 
 // 生のリクエストボディを取得するためのミドルウェア
 app.use('/webhook', express.raw({ type: 'application/json' }));
@@ -140,17 +141,11 @@ async function handleEvent(event) {
     const messageText = event.message.text;
     const timestamp = event.timestamp;
     
-    // 会話状態を取得または初期化
-    if (!conversations[userId]) {
-      conversations[userId] = {
-        lastMessage: null,
-        needsResponse: false
-      };
-    }
-    
-    // 特別コマンド処理：すべて返信済みにする
+    // 特別コマンド: すべて返信済みにする
     if (messageText === '全部返信済み' || messageText === 'すべて返信済み') {
-      conversations[userId].needsResponse = false;
+      if (userStates[userId]) {
+        userStates[userId].awaitingReply = false;
+      }
       
       await sendSlackNotification(`*すべて返信済みにしました*\n*ユーザー*: ${userDisplayName}\nこのユーザーの未返信状態をクリアしました。`);
       
@@ -160,34 +155,50 @@ async function handleEvent(event) {
       });
     }
     
-    // ユーザーからの新しいメッセージとして記録
-    const prevMessage = conversations[userId].lastMessage;
-    
-    // 新しいメッセージを記録
-    conversations[userId].lastMessage = {
-      id: messageId,
-      text: messageText,
-      timestamp: timestamp,
-      userName: userDisplayName,
-      sourceType: sourceType
-    };
-    
-    // 応答待ちの場合は、前のメッセージの「応答待ち」フラグをクリア
-    if (conversations[userId].needsResponse) {
-      conversations[userId].needsResponse = false;
-      
-      // 前回のメッセージに対する返信としてマーク
-      if (prevMessage) {
-        await sendSlackNotification(`*返信完了*\n*ユーザー*: ${userDisplayName}\n*元のメッセージ*: ${prevMessage.text}\n*返信内容*: ${messageText}`);
-        console.log(`ユーザー${userId}の前回のメッセージに対する返信を記録しました`);
-      }
+    // ユーザーの状態を確認・初期化
+    if (!userStates[userId]) {
+      userStates[userId] = {
+        lastTimestamp: timestamp,
+        awaitingReply: false,  // 初回メッセージでは返信不要
+        lastMessage: {
+          text: messageText,
+          id: messageId
+        },
+        displayName: userDisplayName,
+        sourceType: sourceType
+      };
     } else {
-      // 前回が応答待ちでない場合は、新しいメッセージを応答待ちとしてマーク
-      conversations[userId].needsResponse = true;
+      // 既存ユーザーの場合、メッセージ受信で状態を更新
+      
+      // 現在の状態を保存
+      const wasAwaitingReply = userStates[userId].awaitingReply;
+      const prevMessage = userStates[userId].lastMessage;
+      
+      // ユーザーからの新しいメッセージが来た場合
+      // - メッセージを保存
+      // - 「返信待ち」の状態をトグル（falseならtrue、trueならfalse）
+      
+      // 状態を更新
+      userStates[userId] = {
+        lastTimestamp: timestamp,
+        awaitingReply: !wasAwaitingReply,  // トグル: falseならtrue、trueならfalse
+        lastMessage: {
+          text: messageText,
+          id: messageId
+        },
+        displayName: userDisplayName,
+        sourceType: sourceType
+      };
+      
+      // もし前回が「返信待ち」だった場合、それを返信済みにした旨を記録
+      if (wasAwaitingReply) {
+        await sendSlackNotification(`*返信完了*\n*ユーザー*: ${userDisplayName}\n*元のメッセージ*: ${prevMessage?.text || 'Unknown'}\n*返信内容*: ${messageText}`);
+        console.log(`ユーザー${userId}の返信を記録しました`);
+      }
     }
     
-    // 現在の会話状態をデバッグ出力
-    console.log(`ユーザー${userId}の会話状態:`, JSON.stringify(conversations[userId]));
+    // 現在の状態をログ出力
+    console.log(`ユーザー${userId}の状態:`, JSON.stringify(userStates[userId]));
     
     // Slackに通知を送信
     const sourceTypeText = {
@@ -196,17 +207,7 @@ async function handleEvent(event) {
       'room': 'ルーム'
     }[sourceType] || '不明';
     
-    await sendSlackNotification(`*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*メッセージID*: ${messageId}`);
-    
-    console.log(`ユーザー${userId}からの新規メッセージを記録しました: ${messageText}`);
-    
-    // 1分後にリマインダーチェックを実行（デバッグ用）
-    setTimeout(() => {
-      console.log('1分後のデバッグチェック - 現在の会話状態:');
-      for (const uid in conversations) {
-        console.log(`ユーザー${uid}:`, JSON.stringify(conversations[uid]));
-      }
-    }, 60000);
+    await sendSlackNotification(`*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*メッセージID*: ${messageId}\n*返信待ちになりましたか*: ${userStates[userId].awaitingReply ? 'はい' : 'いいえ'}`);
     
   } catch (error) {
     console.error('メッセージ処理エラー:', error);
@@ -214,81 +215,60 @@ async function handleEvent(event) {
 
   return Promise.resolve(null);
 }
-// 1分ごとにリマインダーチェックを実行
+
+// 1分ごとに未返信メッセージをチェックするスケジューラー
 cron.schedule('* * * * *', async () => {
   console.log('1分間隔の未返信チェック実行中...', new Date().toISOString());
-  await checkUnrepliedMessages();
-});
-
-// 10分ごとのチェックは必要なければ削除または無効化可能
-// cron.schedule('*/10 * * * *', async () => {
-//   console.log('デバッグ用10分チェック実行中...', new Date().toISOString());
-//   await checkUnrepliedMessages();
-// });
-// 未返信メッセージをチェックして通知する関数
-async function checkUnrepliedMessages() {
+  
   const now = Date.now();
   const oneMinuteInMs = 1 * 60 * 1000;  // 1分をミリ秒に変換
   
-  console.log('現在の会話状態全体:', JSON.stringify(conversations));
+  let unrepliedUsers = [];
   
-  let unrepliedMessagesAll = [];
-  
-  // すべてのユーザーの会話をチェック
-  for (const userId in conversations) {
-    const convo = conversations[userId];
+  // すべてのユーザーの状態をチェック
+  for (const userId in userStates) {
+    const state = userStates[userId];
     
-    console.log(`ユーザー${userId}のチェック:`, JSON.stringify(convo));
-    
-    // 応答待ちのメッセージがあり、1分以上経過していれば未返信としてマーク
-    if (convo.needsResponse && convo.lastMessage) {
-      const elapsedTime = now - convo.lastMessage.timestamp;
+    // 「返信待ち」かつ1分以上経過している場合
+    if (state.awaitingReply) {
+      const elapsedTime = now - state.lastTimestamp;
       const elapsedMinutes = Math.floor(elapsedTime / (60 * 1000));
       
-      console.log(`ユーザー${userId}の最後のメッセージ:`, 
-                 `ID=${convo.lastMessage.id}`, 
-                 `経過時間=${elapsedMinutes}分`, 
-                 `応答待ち=${convo.needsResponse}`);
-      
       if (elapsedTime >= oneMinuteInMs) {
-        unrepliedMessagesAll.push({
-          userId: userId,
-          userName: convo.lastMessage.userName || 'Unknown User',
-          message: convo.lastMessage,
-          elapsedMinutes: elapsedMinutes,
-          sourceType: convo.lastMessage.sourceType || 'unknown'
+        unrepliedUsers.push({
+          userId,
+          name: state.displayName,
+          message: state.lastMessage,
+          elapsedMinutes,
+          sourceType: state.sourceType
         });
       }
     }
   }
   
-  console.log(`検出された未返信メッセージ: ${unrepliedMessagesAll.length}件`);
+  console.log(`未返信ユーザー数: ${unrepliedUsers.length}`);
   
   // Slackにリマインダーを送信
-  if (unrepliedMessagesAll.length > 0) {
+  if (unrepliedUsers.length > 0) {
     try {
-      const reminderText = unrepliedMessagesAll.map(item => {
+      const reminderText = unrepliedUsers.map(user => {
         const sourceTypeText = {
           'user': '個別チャット',
           'group': 'グループ',
           'room': 'ルーム'
-        }[item.sourceType] || '不明';
+        }[user.sourceType] || '不明';
         
-        return `*送信者*: ${item.userName}\n*送信元*: ${sourceTypeText}\n*内容*: ${item.message.text}\n*メッセージID*: ${item.message.id}\n*経過時間*: ${item.elapsedMinutes}分`;
+        return `*送信者*: ${user.name}\n*送信元*: ${sourceTypeText}\n*内容*: ${user.message.text}\n*メッセージID*: ${user.message.id}\n*経過時間*: ${user.elapsedMinutes}分`;
       }).join('\n\n');
-      
-      console.log('Slackにリマインダーを送信します:', reminderText);
       
       await sendSlackNotification(`*【1分以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`);
       
-      console.log(`${unrepliedMessagesAll.length}件のリマインダーをSlackに送信しました`);
+      console.log(`${unrepliedUsers.length}件のリマインダーをSlackに送信しました`);
     } catch (error) {
       console.error('Slackリマインダー送信エラー:', error);
     }
-  } else {
-    console.log('未返信メッセージはありません');
   }
-}
+});
 
 // サーバー起動
 const PORT = process.env.PORT || 3000;
