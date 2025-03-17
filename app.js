@@ -188,7 +188,7 @@ async function handleEvent(event) {
       };
     }
     
-    console.log(ユーザー${userId}の会話状態:, JSON.stringify(conversations[userId]));
+    console.log(`ユーザー${userId}の会話状態:`, JSON.stringify(conversations[userId]));
     
     // Slackに通知を送信
     const sourceTypeText = {
