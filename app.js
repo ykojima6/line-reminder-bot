@@ -214,24 +214,21 @@ async function handleEvent(event) {
 
   return Promise.resolve(null);
 }
-
-// 1時間ごとに未返信メッセージをチェックするスケジューラー
-// cron式: '0 * * * *' は1時間ごとに実行（0分ごとに実行）
-cron.schedule('0 * * * *', async () => {
-  console.log('未返信チェック実行中...', new Date().toISOString());
+// 1分ごとにリマインダーチェックを実行
+cron.schedule('* * * * *', async () => {
+  console.log('1分間隔の未返信チェック実行中...', new Date().toISOString());
   await checkUnrepliedMessages();
 });
 
-// 10分ごとにリマインダーチェックを実行（デバッグ用、本番は必要に応じて調整）
-cron.schedule('*/10 * * * *', async () => {
-  console.log('デバッグ用10分チェック実行中...', new Date().toISOString());
-  await checkUnrepliedMessages();
-});
-
+// 10分ごとのチェックは必要なければ削除または無効化可能
+// cron.schedule('*/10 * * * *', async () => {
+//   console.log('デバッグ用10分チェック実行中...', new Date().toISOString());
+//   await checkUnrepliedMessages();
+// });
 // 未返信メッセージをチェックして通知する関数
 async function checkUnrepliedMessages() {
   const now = Date.now();
-  const sixHoursInMs = 1 * 60 * 1000;  // 6時間をミリ秒に変換
+  const oneMinuteInMs = 1 * 60 * 1000;  // 1分をミリ秒に変換
   
   console.log('現在の会話状態全体:', JSON.stringify(conversations));
   
@@ -243,22 +240,22 @@ async function checkUnrepliedMessages() {
     
     console.log(`ユーザー${userId}のチェック:`, JSON.stringify(convo));
     
-    // 応答待ちのメッセージがあり、6時間以上経過していれば未返信としてマーク
+    // 応答待ちのメッセージがあり、1分以上経過していれば未返信としてマーク
     if (convo.needsResponse && convo.lastMessage) {
       const elapsedTime = now - convo.lastMessage.timestamp;
-      const elapsedHours = Math.floor(elapsedTime / (1 * 60 * 1000));
+      const elapsedMinutes = Math.floor(elapsedTime / (60 * 1000));
       
       console.log(`ユーザー${userId}の最後のメッセージ:`, 
                  `ID=${convo.lastMessage.id}`, 
-                 `経過時間=${elapsedHours}時間`, 
+                 `経過時間=${elapsedMinutes}分`, 
                  `応答待ち=${convo.needsResponse}`);
       
-      if (elapsedTime >= sixHoursInMs) {
+      if (elapsedTime >= oneMinuteInMs) {
         unrepliedMessagesAll.push({
           userId: userId,
           userName: convo.lastMessage.userName || 'Unknown User',
           message: convo.lastMessage,
-          elapsedHours: elapsedHours,
+          elapsedMinutes: elapsedMinutes,
           sourceType: convo.lastMessage.sourceType || 'unknown'
         });
       }
@@ -277,12 +274,12 @@ async function checkUnrepliedMessages() {
           'room': 'ルーム'
         }[item.sourceType] || '不明';
         
-        return `*送信者*: ${item.userName}\n*送信元*: ${sourceTypeText}\n*内容*: ${item.message.text}\n*メッセージID*: ${item.message.id}\n*経過時間*: ${item.elapsedHours}時間`;
+        return `*送信者*: ${item.userName}\n*送信元*: ${sourceTypeText}\n*内容*: ${item.message.text}\n*メッセージID*: ${item.message.id}\n*経過時間*: ${item.elapsedMinutes}分`;
       }).join('\n\n');
       
       console.log('Slackにリマインダーを送信します:', reminderText);
       
-      await sendSlackNotification(`*【6時間以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`);
+      await sendSlackNotification(`*【1分以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`);
       
       console.log(`${unrepliedMessagesAll.length}件のリマインダーをSlackに送信しました`);
     } catch (error) {
