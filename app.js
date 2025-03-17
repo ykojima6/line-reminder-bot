@@ -22,7 +22,7 @@ console.log('環境変数の状態:');
 console.log('LINE_CHANNEL_ACCESS_TOKEN exists:', !!process.env.LINE_CHANNEL_ACCESS_TOKEN);
 console.log('LINE_CHANNEL_SECRET exists:', !!process.env.LINE_CHANNEL_SECRET);
 console.log('SLACK_WEBHOOK_URL exists:', !!process.env.SLACK_WEBHOOK_URL);
-console.log('返信済みとみなすユーザーID:', REPLY_USER_ID);
+console.log('REPLY_USER_ID:', REPLY_USER_ID);
 
 // LINEクライアントを初期化
 const client = new line.Client(config);
@@ -47,22 +47,34 @@ app.get('/webhook', (req, res) => {
   res.send('LINE Bot Webhook is working. Please use POST method for actual webhook.');
 });
 
+// デバッグ用ルート
+app.get('/debug', (req, res) => {
+  const debugInfo = {
+    messageCount: messageHistory.length,
+    unrepliedCount: messageHistory.filter(msg => !msg.replied && msg.userId !== REPLY_USER_ID).length,
+    recentMessages: messageHistory.slice(-5) // 最新5件のメッセージ
+  };
+  res.json(debugInfo);
+});
+
 // Slackに通知を送信する関数
 async function sendSlackNotification(message) {
   if (!SLACK_WEBHOOK_URL) {
     console.log('Slack Webhook URLが設定されていないため、通知をスキップします');
-    return;
+    return false;
   }
 
   try {
     console.log('Slack通知を送信します:', message.substring(0, 100) + (message.length > 100 ? '...' : ''));
     const response = await axios.post(SLACK_WEBHOOK_URL, { text: message });
     console.log('Slack通知を送信しました, ステータス:', response.status);
+    return true;
   } catch (error) {
     console.error('Slack通知の送信に失敗しました:', error.message);
     if (error.response) {
       console.error('レスポンス:', error.response.status, error.response.data);
     }
+    return false;
   }
 }
 
@@ -113,7 +125,7 @@ app.post('/webhook', (req, res) => {
 
 // イベントハンドラー
 async function handleEvent(event) {
-  console.log('イベント処理:', event.type);
+  console.log('イベント処理:', event.type, 'イベントデータ:', JSON.stringify(event));
   
   // メッセージイベントのみ処理
   if (event.type !== 'message' || event.message.type !== 'text') {
@@ -131,6 +143,7 @@ async function handleEvent(event) {
       } else if (event.source.type === 'user') {
         senderProfile = await client.getProfile(event.source.userId);
       }
+      console.log('送信者プロフィール取得成功:', JSON.stringify(senderProfile));
     } catch (error) {
       console.log('プロフィール取得エラー:', error.message);
       senderProfile = { displayName: 'Unknown User' };
@@ -146,19 +159,21 @@ async function handleEvent(event) {
     // チャットID (グループ、ルーム、または個別チャットのID)
     const chatId = event.source.groupId || event.source.roomId || userId;
     
+    console.log(`メッセージ情報: userId=${userId}, displayName=${userDisplayName}, ` +
+                `sourceType=${sourceType}, chatId=${chatId}, text=${messageText}`);
+    
     // 特別コマンド処理: すべて返信済みにする
     if (messageText === '全部返信済み' || messageText === 'すべて返信済み') {
       // メッセージ履歴からこのチャットの未返信メッセージをすべて削除
       const messageCount = messageHistory.length;
-      const filteredMessages = messageHistory.filter(msg => 
-        msg.chatId !== chatId || msg.userId === REPLY_USER_ID
-      );
-      messageHistory.length = 0;
-      messageHistory.push(...filteredMessages);
+      for (let i = 0; i < messageHistory.length; i++) {
+        if (messageHistory[i].chatId === chatId) {
+          messageHistory[i].replied = true;
+        }
+      }
       
-      const removedCount = messageCount - messageHistory.length;
-      
-      await sendSlackNotification(`*すべて返信済みにしました*\n*ユーザー*: ${userDisplayName}\nこのチャットの未返信メッセージ ${removedCount}件 をクリアしました。`);
+      const message = `*すべて返信済みにしました*\n*ユーザー*: ${userDisplayName}\nこのチャットのすべてのメッセージを返信済みとしてマークしました。`;
+      await sendSlackNotification(message);
       
       return client.replyMessage(event.replyToken, {
         type: 'text',
@@ -192,7 +207,9 @@ async function handleEvent(event) {
         'room': 'ルーム'
       }[sourceType] || '不明';
       
-      await sendSlackNotification(`*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*メッセージID*: ${messageId}`);
+      const notificationText = `*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*メッセージID*: ${messageId}`;
+      const notificationSent = await sendSlackNotification(notificationText);
+      console.log('Slack通知送信結果:', notificationSent ? '成功' : '失敗');
     } else {
       console.log(`自分からのメッセージを記録しました: ${messageText}`);
       
@@ -229,7 +246,7 @@ cron.schedule('* * * * *', async () => {
            (now - msg.timestamp) >= oneMinuteInMs;
   });
   
-  console.log(`未返信メッセージ数: ${unrepliedMessages.length}`);
+  console.log(`未返信メッセージ数: ${unrepliedMessages.length}/${messageHistory.length}`);
   
   // Slackにリマインダーを送信
   if (unrepliedMessages.length > 0) {
@@ -246,9 +263,10 @@ cron.schedule('* * * * *', async () => {
         return `*送信者*: ${msg.userDisplayName}\n*送信元*: ${sourceTypeText}\n*内容*: ${msg.messageText}\n*メッセージID*: ${msg.messageId}\n*経過時間*: ${elapsedMinutes}分`;
       }).join('\n\n');
       
-      await sendSlackNotification(`*【1分以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`);
+      const notificationText = `*【1分以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`;
+      const notificationSent = await sendSlackNotification(notificationText);
       
-      console.log(`${unrepliedMessages.length}件のリマインダーをSlackに送信しました`);
+      console.log(`${unrepliedMessages.length}件のリマインダーをSlackに送信しました: ${notificationSent ? '成功' : '失敗'}`);
     } catch (error) {
       console.error('Slackリマインダー送信エラー:', error);
     }
@@ -264,6 +282,11 @@ cron.schedule('* * * * *', async () => {
     messageHistory.push(...filteredMessages);
     console.log(`古いメッセージをクリーンアップしました: ${currentLength - messageHistory.length}件削除`);
   }
+});
+
+// エラーハンドリング
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
 // サーバー起動
