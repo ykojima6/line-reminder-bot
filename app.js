@@ -1,42 +1,37 @@
-// LINE未返信リマインダーボット
-// 公式LINEアカウントからのメッセージを監視し、12時間以上未返信の場合にリマインドする
-
 const express = require('express');
 const line = require('@line/bot-sdk');
 const cron = require('node-cron');
 const app = express();
 
-// データベース代わりのメッセージ保存用オブジェクト
-const messageStore = {
-  // userId: {
-  //   messageId: {
-  //     text: 'メッセージ内容',
-  //     sender: 'senderId',
-  //     senderName: '送信者名',
-  //     timestamp: Date.now(),
-  //     replied: false
-  //   }
-  // }
-};
-
 // LINE API設定
 const config = {
-  channelAccessToken: 'Dmbv7fVtj/elO9ccW1QOCws7hQFeFHR/jJt0aZqH6jtbfh48T1ZDBvM9Nnxgg38Cwxmgf/h44mjRGJvStj7s1K1DN4OYz5g6RB3yfsThi9iBzGyP1t+bSxD8J//+5hdtkRXw17yLN88g/erAvWvlqQdB04t89/1O/w1cDnyilFU=',
-  channelSecret: '6b51d27e178d6daf1948fdaad22cde04'
+  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN || 'Dmbv7fVtj/elO9ccW1QOCws7hQFeFHR/jJt0aZqH6jtbfh48T1ZDBvM9Nnxgg38Cwxmgf/h44mjRGJvStj7s1K1DN4OYz5g6RB3yfsThi9iBzGyP1t+bSxD8J//+5hdtkRXw17yLN88g/erAvWvlqQdB04t89/1O/w1cDnyilFU=',
+  channelSecret: process.env.LINE_CHANNEL_SECRET || '6b51d27e178d6daf1948fdaad22cde04'
 };
 
-const client = new line.Client(config);
+// JSONボディパーサー
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
 // ルートパスへのハンドラーを追加
 app.get('/', (req, res) => {
   res.send('LINE Bot Server is running!');
 });
-// Webhookルート
+
+// 単純なWebhookのテスト用ルート
+app.post('/webhook-test', (req, res) => {
+  console.log('Webhook test received');
+  res.status(200).send('OK');
+});
+
+// LINE Bot用Webhookルート
 app.post('/webhook', line.middleware(config), (req, res) => {
+  console.log('Webhook received:', req.body);
   Promise
     .all(req.body.events.map(handleEvent))
     .then((result) => res.json(result))
     .catch((err) => {
-      console.error(err);
+      console.error('Webhook error:', err);
       res.status(500).end();
     });
 });
