@@ -51,10 +51,14 @@ async function sendSlackNotification(message) {
   }
 
   try {
-    await axios.post(SLACK_WEBHOOK_URL, { text: message });
-    console.log('Slack通知を送信しました');
+    console.log('Slack通知を送信します:', message.substring(0, 100) + (message.length > 100 ? '...' : ''));
+    const response = await axios.post(SLACK_WEBHOOK_URL, { text: message });
+    console.log('Slack通知を送信しました, ステータス:', response.status);
   } catch (error) {
-    console.error('Slack通知の送信に失敗しました:', error);
+    console.error('Slack通知の送信に失敗しました:', error.message);
+    if (error.response) {
+      console.error('レスポンス:', error.response.status, error.response.data);
+    }
   }
 }
 
@@ -149,12 +153,6 @@ async function handleEvent(event) {
         
         // Slackに通知を送信
         await sendSlackNotification(`*新規メッセージ*\n*送信者*: ${senderProfile.displayName}\n*内容*: ${event.message.text}\n*メッセージID*: ${event.message.id}`);
-        
-        // 確認用の返信（オプション - 実際の運用では不要かもしれません）
-        // return client.replyMessage(event.replyToken, {
-        //   type: 'text',
-        //   text: `${senderProfile.displayName}からのメッセージを記録しました。`
-        // });
       }
     } catch (error) {
       console.error('メッセージ処理エラー:', error);
@@ -199,7 +197,6 @@ async function handleEvent(event) {
       }
       
       // 自動返信を行わない（Slackで確認して手動で対応する）
-      // 必要に応じてここにコードを追加
     } catch (error) {
       console.error('メッセージ処理エラー:', error);
     }
@@ -208,15 +205,12 @@ async function handleEvent(event) {
   return Promise.resolve(null);
 }
 
-// 5分ごとに未返信メッセージをチェックするスケジューラー
-// cron式: '*/5 * * * *' は5分ごとに実行
-cron.schedule('*/5 * * * *', async () => {
-  console.log('5分間隔の未返信チェック実行中...', new Date().toISOString());
+// 1分ごとに未返信メッセージをチェックするスケジューラー
+// cron式: '* * * * *' は1分ごとに実行
+cron.schedule('* * * * *', async () => {
+  console.log('1分間隔の未返信チェック実行中...', new Date().toISOString());
   const now = Date.now();
-  const fiveMinutesInMs = 5 * 60 * 1000;
-  
-  // デバッグログ - メッセージストアの状態確認
-  console.log('現在のメッセージストア状態:', JSON.stringify(messageStore, null, 2));
+  const oneMinuteInMs = 1 * 60 * 1000;
   
   let totalUnrepliedCount = 0;
   
@@ -225,15 +219,15 @@ cron.schedule('*/5 * * * *', async () => {
     const userMessages = messageStore[userId];
     const unrepliedMessages = [];
     
-    // 未返信で5分経過したメッセージを抽出
+    // 未返信で1分経過したメッセージを抽出
     for (const messageId in userMessages) {
       const message = userMessages[messageId];
       const elapsedTime = now - message.timestamp;
       
       console.log(`メッセージID: ${messageId}, 返信済み: ${message.replied}, 経過時間: ${Math.floor(elapsedTime / (60 * 1000))}分`);
       
-      // 5分以上12時間未満の未返信メッセージをチェック
-      if (!message.replied && elapsedTime >= fiveMinutesInMs && elapsedTime < 12 * 60 * 60 * 1000) {
+      // 1分以上経過した未返信メッセージをチェック
+      if (!message.replied && elapsedTime >= oneMinuteInMs) {
         unrepliedMessages.push(message);
         totalUnrepliedCount++;
       }
@@ -248,63 +242,16 @@ cron.schedule('*/5 * * * *', async () => {
         
         console.log('Slackにリマインダーを送信します:', reminderText);
         
-        await sendSlackNotification(`*【5分経過リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`);
+        await sendSlackNotification(`*【未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`);
         
-        console.log(`${unrepliedMessages.length}件の5分リマインダーをSlackに送信しました`);
+        console.log(`${unrepliedMessages.length}件のリマインダーをSlackに送信しました`);
       } catch (error) {
         console.error('Slackリマインダー送信エラー:', error);
       }
     }
   }
   
-  console.log(`5分チェック完了: 合計${totalUnrepliedCount}件の未返信メッセージを検出`);
-});
-
-// 12時間ごとに未返信メッセージをチェックするスケジューラー
-cron.schedule('0 */12 * * *', async () => {
-  console.log('12時間間隔の未返信チェック実行中...');
-  const now = Date.now();
-  const twelveHoursInMs = 12 * 60 * 60 * 1000;
-  
-  // 各ユーザーのメッセージをチェック
-  for (const userId in messageStore) {
-    const userMessages = messageStore[userId];
-    const unrepliedMessages = [];
-    
-    // 未返信で12時間経過したメッセージを抽出
-    for (const messageId in userMessages) {
-      const message = userMessages[messageId];
-      if (!message.replied && (now - message.timestamp) >= twelveHoursInMs) {
-        unrepliedMessages.push(message);
-      }
-    }
-    
-    // LINEとSlackの両方にリマインダーを送信
-    if (unrepliedMessages.length > 0) {
-      try {
-        const reminderTextLine = unrepliedMessages.map(msg => 
-          `${msg.senderName}からのメッセージ: ${msg.text.substring(0, 30)}... (返信対象ID:${msg.messageId})`
-        ).join('\n\n');
-        
-        // LINEに通知
-        await client.pushMessage(userId, {
-          type: 'text',
-          text: `【リマインダー】\n以下のメッセージに12時間以上返信がありません:\n\n${reminderTextLine}`
-        });
-        
-        // Slackにも通知
-        const reminderTextSlack = unrepliedMessages.map(msg => 
-          `*送信者*: ${msg.senderName}\n*内容*: ${msg.text}\n*メッセージID*: ${msg.messageId}\n*経過時間*: 12時間以上`
-        ).join('\n\n');
-        
-        await sendSlackNotification(`*【12時間経過リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderTextSlack}`);
-        
-        console.log(`ユーザー${userId}に${unrepliedMessages.length}件の12時間リマインダーを送信しました`);
-      } catch (error) {
-        console.error('リマインダー送信エラー:', error);
-      }
-    }
-  }
+  console.log(`1分チェック完了: 合計${totalUnrepliedCount}件の未返信メッセージを検出`);
 });
 
 // 古いメッセージを定期的にクリーンアップする処理
