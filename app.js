@@ -5,8 +5,8 @@ const app = express();
 
 // LINE API設定
 const config = {
-  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN || 'Dmbv7fVtj/elO9ccW1QOCws7hQFeFHR/jJt0aZqH6jtbfh48T1ZDBvM9Nnxgg38Cwxmgf/h44mjRGJvStj7s1K1DN4OYz5g6RB3yfsThi9iBzGyP1t+bSxD8J//+5hdtkRXw17yLN88g/erAvWvlqQdB04t89/1O/w1cDnyilFU=',
-  channelSecret: process.env.LINE_CHANNEL_SECRET || '6b51d27e178d6daf1948fdaad22cde04'
+  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
+  channelSecret: process.env.LINE_CHANNEL_SECRET
 };
 
 // LINEクライアントを初期化（これが欠けていました）
