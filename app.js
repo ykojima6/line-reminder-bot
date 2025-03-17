@@ -11,8 +11,17 @@ const config = {
   channelSecret: process.env.LINE_CHANNEL_SECRET
 };
 
+// 環境変数の検証
+if (!process.env.LINE_CHANNEL_ACCESS_TOKEN || !process.env.LINE_CHANNEL_SECRET) {
+  console.error('エラー: LINE_CHANNEL_ACCESS_TOKEN または LINE_CHANNEL_SECRET が設定されていません');
+  process.exit(1);
+}
+
 // Slack Webhook URL (環境変数として設定)
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
+if (!SLACK_WEBHOOK_URL) {
+  console.warn('警告: SLACK_WEBHOOK_URL が設定されていません。Slack通知は無効になります');
+}
 
 // ログ出力
 console.log('環境変数の状態:');
@@ -24,11 +33,8 @@ console.log('SLACK_WEBHOOK_URL exists:', !!process.env.SLACK_WEBHOOK_URL);
 const client = new line.Client(config);
 
 // 会話状態管理: ユーザーごとに最後のメッセージが自分（ボット）からかユーザーからかを保存
-// { userId: { lastMessageFromUser: boolean, lastTimestamp, lastMessage } }
+// { userId: { lastMessageFromUser: boolean, lastTimestamp, lastMessage, replyRequired: boolean } }
 const conversations = {};
-
-// ボットのユーザーID（取得できない場合は空文字で対応）
-const BOT_USER_ID = 'Ubf54091c82026dcfb8ede187814fdb9b'; 
 
 // 生のリクエストボディを取得するためのミドルウェア
 app.use('/webhook', express.raw({ type: 'application/json' }));
@@ -81,7 +87,8 @@ app.post('/webhook', (req, res) => {
   const body = req.body;
   const channelSecret = process.env.LINE_CHANNEL_SECRET;
   const hmac = crypto.createHmac('SHA256', channelSecret);
-  const bodyStr = Buffer.isBuffer(body) ? body.toString() : JSON.stringify(body);
+  // バッファをそのまま使用して署名計算（バイナリセーフ）
+  const bodyStr = Buffer.isBuffer(body) ? body : Buffer.from(JSON.stringify(body));
   const digestFromBody = hmac.update(bodyStr).digest('base64');
   
   if (digestFromBody !== signature) {
@@ -110,6 +117,14 @@ app.post('/webhook', (req, res) => {
       console.error('イベント処理エラー:', err);
     });
 });
+
+// メッセージがボットからのものかどうかを判定する関数
+// source.type が 'user' で、イベントタイプがwebhookイベントである場合、
+// このメッセージはボットからのものではなくユーザーからのものと判断する
+function isUserMessage(event) {
+  // webhookイベントはLINEユーザーからのメッセージを示す
+  return event.source && event.source.type === 'user';
+}
 
 // イベントハンドラー
 async function handleEvent(event) {
@@ -143,11 +158,15 @@ async function handleEvent(event) {
     const messageText = event.message.text;
     const timestamp = event.timestamp;
     
+    // メッセージの送信者を判定（APIからの情報を使用）
+    const isFromUser = isUserMessage(event);
+    
     // 特別コマンド処理: すべて返信済みにする
     if (messageText === '全部返信済み' || messageText === 'すべて返信済み') {
       if (conversations[userId]) {
         // 最後のメッセージがボットからのものとしてマーク
         conversations[userId].lastMessageFromUser = false;
+        conversations[userId].replyRequired = false;
       }
       
       await sendSlackNotification(`*すべて返信済みにしました*\n*ユーザー*: ${userDisplayName}\nこのユーザーへの未返信状態をクリアしました。`);
@@ -158,35 +177,19 @@ async function handleEvent(event) {
       });
     }
     
-    // 送信元がユーザーかボットか判定
-    const isFromUser = userId !== BOT_USER_ID;
-    
     // 会話状態を更新
-    if (!conversations[userId]) {
-      // 初めてのメッセージ
-      conversations[userId] = {
-        lastMessageFromUser: isFromUser,
-        lastTimestamp: timestamp,
-        lastMessage: {
-          text: messageText,
-          id: messageId
-        },
-        displayName: userDisplayName,
-        sourceType: sourceType
-      };
-    } else {
-      // 会話状態を更新
-      conversations[userId] = {
-        lastMessageFromUser: isFromUser,
-        lastTimestamp: timestamp,
-        lastMessage: {
-          text: messageText,
-          id: messageId
-        },
-        displayName: userDisplayName,
-        sourceType: sourceType
-      };
-    }
+    conversations[userId] = {
+      lastMessageFromUser: isFromUser,
+      lastTimestamp: timestamp,
+      lastMessage: {
+        text: messageText,
+        id: messageId
+      },
+      displayName: userDisplayName,
+      sourceType: sourceType,
+      // ユーザーからのメッセージの場合、返信が必要とマーク
+      replyRequired: isFromUser
+    };
     
     console.log(`ユーザー${userId}の会話状態:`, JSON.stringify(conversations[userId]));
     
@@ -200,11 +203,12 @@ async function handleEvent(event) {
     // ユーザーからのメッセージの場合のみ通知
     if (isFromUser) {
       await sendSlackNotification(`*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*メッセージID*: ${messageId}`);
-    }
-    
-    // ボットからの返信の場合
-    if (!isFromUser) {
-      console.log(`ボットからの返信を記録しました: ${messageText}`);
+    } else {
+      // ボットからの返信の場合、そのユーザーの返信フラグをクリア
+      if (conversations[userId]) {
+        conversations[userId].replyRequired = false;
+        console.log(`ボットからの返信を記録しました: ${messageText}`);
+      }
     }
     
   } catch (error) {
@@ -215,57 +219,91 @@ async function handleEvent(event) {
 }
 
 // 1分ごとに未返信メッセージをチェックするスケジューラー
+let isCheckingUnreplied = false; // 実行中フラグ
+
 cron.schedule('* * * * *', async () => {
+  // 前回の実行が完了していない場合はスキップ
+  if (isCheckingUnreplied) {
+    console.log('前回の未返信チェックが進行中のためスキップします');
+    return;
+  }
+  
+  isCheckingUnreplied = true;
   console.log('1分間隔の未返信チェック実行中...', new Date().toISOString());
   
-  const now = Date.now();
-  const oneMinuteInMs = 1 * 60 * 1000;  // 1分をミリ秒に変換
-  
-  let unrepliedUsers = [];
-  
-  // すべてのユーザーの状態をチェック
-  for (const userId in conversations) {
-    const convo = conversations[userId];
+  try {
+    const now = Date.now();
+    const oneMinuteInMs = 1 * 60 * 1000;  // 1分をミリ秒に変換
     
-    // 最後のメッセージがユーザーからのもので、1分以上経過している場合
-    if (convo.lastMessageFromUser) {
-      const elapsedTime = now - convo.lastTimestamp;
-      const elapsedMinutes = Math.floor(elapsedTime / (60 * 1000));
+    let unrepliedUsers = [];
+    
+    // すべてのユーザーの状態をチェック
+    for (const userId in conversations) {
+      const convo = conversations[userId];
       
-      if (elapsedTime >= oneMinuteInMs) {
-        unrepliedUsers.push({
-          userId,
-          name: convo.displayName,
-          message: convo.lastMessage,
-          elapsedMinutes,
-          sourceType: convo.sourceType
-        });
+      // 最後のメッセージがユーザーからのもので、返信が必要でまだされていない場合
+      if (convo.lastMessageFromUser && convo.replyRequired) {
+        const elapsedTime = now - convo.lastTimestamp;
+        const elapsedMinutes = Math.floor(elapsedTime / (60 * 1000));
+        
+        if (elapsedTime >= oneMinuteInMs) {
+          unrepliedUsers.push({
+            userId,
+            name: convo.displayName,
+            message: convo.lastMessage,
+            elapsedMinutes,
+            sourceType: convo.sourceType
+          });
+        }
       }
     }
-  }
-  
-  console.log(`未返信ユーザー数: ${unrepliedUsers.length}`);
-  
-  // Slackにリマインダーを送信
-  if (unrepliedUsers.length > 0) {
-    try {
-      const reminderText = unrepliedUsers.map(user => {
-        const sourceTypeText = {
-          'user': '個別チャット',
-          'group': 'グループ',
-          'room': 'ルーム'
-        }[user.sourceType] || '不明';
+    
+    console.log(`未返信ユーザー数: ${unrepliedUsers.length}`);
+    
+    // Slackにリマインダーを送信
+    if (unrepliedUsers.length > 0) {
+      try {
+        const reminderText = unrepliedUsers.map(user => {
+          const sourceTypeText = {
+            'user': '個別チャット',
+            'group': 'グループ',
+            'room': 'ルーム'
+          }[user.sourceType] || '不明';
+          
+          return `*送信者*: ${user.name}\n*送信元*: ${sourceTypeText}\n*内容*: ${user.message.text}\n*メッセージID*: ${user.message.id}\n*経過時間*: ${user.elapsedMinutes}分`;
+        }).join('\n\n');
         
-        return `*送信者*: ${user.name}\n*送信元*: ${sourceTypeText}\n*内容*: ${user.message.text}\n*メッセージID*: ${user.message.id}\n*経過時間*: ${user.elapsedMinutes}分`;
-      }).join('\n\n');
-      
-      await sendSlackNotification(`*【1分以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`);
-      
-      console.log(`${unrepliedUsers.length}件のリマインダーをSlackに送信しました`);
-    } catch (error) {
-      console.error('Slackリマインダー送信エラー:', error);
+        await sendSlackNotification(`*【1分以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`);
+        
+        console.log(`${unrepliedUsers.length}件のリマインダーをSlackに送信しました`);
+      } catch (error) {
+        console.error('Slackリマインダー送信エラー:', error);
+      }
+    }
+  } catch (error) {
+    console.error('未返信チェックエラー:', error);
+  } finally {
+    isCheckingUnreplied = false; // 処理完了フラグ
+  }
+});
+
+// 古い会話データをクリーンアップするスケジューラー（1日に1回）
+cron.schedule('0 0 * * *', () => {
+  console.log('古い会話データをクリーンアップしています...');
+  const now = Date.now();
+  const oneDayInMs = 24 * 60 * 60 * 1000; // 1日をミリ秒に変換
+  
+  let cleanupCount = 0;
+  for (const userId in conversations) {
+    const convo = conversations[userId];
+    // 1日以上前のデータはクリーンアップ
+    if (now - convo.lastTimestamp > oneDayInMs) {
+      delete conversations[userId];
+      cleanupCount++;
     }
   }
+  
+  console.log(`${cleanupCount}件の古い会話データをクリーンアップしました`);
 });
 
 // サーバー起動
