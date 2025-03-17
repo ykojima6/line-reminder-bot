@@ -216,7 +216,7 @@ cron.schedule('0 * * * *', async () => {
     // 応答待ちのメッセージがあり、6時間以上経過していれば未返信としてマーク
     if (convo.pendingResponse && convo.lastMessage) {
       const elapsedTime = now - convo.lastMessage.timestamp;
-      const elapsedHours = Math.floor(elapsedTime / (60 * 60 * 1000));
+      const elapsedHours = Math.floor(elapsedTime / (1 * 60 * 1000));
       
       if (elapsedTime >= sixHoursInMs) {
         // ユーザープロフィールを取得（利用可能であれば）
