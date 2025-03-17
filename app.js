@@ -9,7 +9,17 @@ const config = {
   channelSecret: process.env.LINE_CHANNEL_SECRET
 };
 
-// LINEクライアントを初期化（これが欠けていました）
+// 環境変数の検証
+if (!config.channelAccessToken) {
+  console.error('LINE_CHANNEL_ACCESS_TOKENが設定されていません。');
+  console.error('現在の環境変数:', {
+    LINE_CHANNEL_ACCESS_TOKEN: process.env.LINE_CHANNEL_ACCESS_TOKEN ? '設定されています（値は非表示）' : '設定されていません',
+    LINE_CHANNEL_SECRET: process.env.LINE_CHANNEL_SECRET ? '設定されています（値は非表示）' : '設定されていません'
+  });
+  process.exit(1); // エラーで終了
+}
+
+// LINEクライアントを初期化
 const client = new line.Client(config);
 
 // メッセージを保存するためのオブジェクト（これが欠けていました）
