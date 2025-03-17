@@ -36,6 +36,18 @@ const client = new line.Client(config);
 // { userId: { messageText, timestamp, messageId, displayName, sourceType, needsReply } }
 const messageLog = {};
 
+// メッセージの自動返信応答パターン
+const autoReplyPatterns = [
+  {
+    keywords: ['ありがと', 'thanks', 'thank you', 'サンキュ'],
+    reply: "どういたしまして！何かあればいつでもご連絡ください。"
+  },
+  {
+    keywords: ['了解', 'わかりました', 'わかった', 'OK', 'ok'],
+    reply: null // 自動返信なし、ただし自動的に返信済みとしてマーク
+  }
+];
+
 // デバッグ用ログ履歴
 const debugLogs = [];
 function logDebug(message) {
@@ -106,24 +118,9 @@ async function sendSlackInteractiveNotification(userId, userInfo) {
       'room': 'ルーム'
     }[userInfo.sourceType] || '不明';
     
-    // Slackに通知を送信する
+    // Slackに通知を送信する - シンプルなテキストメッセージに変更
     const message = {
-      text: `*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userInfo.displayName}\n*内容*: ${userInfo.messageText}\n*メッセージID*: ${userInfo.messageId}`,
-      attachments: [
-        {
-          text: "このメッセージに対するアクション:",
-          fallback: "返信済みとしてマークするボタンを表示できません",
-          callback_id: "message_actions",
-          actions: [
-            {
-              name: "mark_replied",
-              text: "返信済みとしてマーク",
-              type: "button",
-              value: userId
-            }
-          ]
-        }
-      ]
+      text: `*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userInfo.displayName}\n*内容*: ${userInfo.messageText}\n*メッセージID*: ${userInfo.messageId}\n\n返信済みにするには: \`/mark-replied ${userId}\` と入力してください。`
     };
     
     const response = await axios.post(SLACK_WEBHOOK_URL, message);
@@ -206,8 +203,15 @@ app.post('/webhook', (req, res) => {
 async function handleEvent(event) {
   logDebug('イベント処理: ' + event.type + ' - イベントID: ' + (event.webhookEventId || 'なし'));
   
-  // メッセージイベント以外は無視
-  if (event.type !== 'message' || event.message.type !== 'text') {
+  // メッセージ以外のイベントも記録（既読イベントなどを確認するため）
+  if (event.type !== 'message') {
+    logDebug(`非メッセージイベント: ${event.type}`);
+    return Promise.resolve(null);
+  }
+  
+  // テキストメッセージ以外は無視
+  if (event.message.type !== 'text') {
+    logDebug(`非テキストメッセージ: ${event.message.type}`);
     return Promise.resolve(null);
   }
 
@@ -324,13 +328,27 @@ async function handleEvent(event) {
       
       logDebug(`ユーザー${userId}のメッセージを記録しました: ${messageText}, 返信必要=true`);
       
-      // ファストリプライ対象かチェック（自動応答）
-      if (messageText.includes('ありがと') || messageText.includes('thanks') || 
-          messageText.includes('thank you') || messageText.includes('サンキュ')) {
-        // お礼への自動応答
-        await sendAutoReply(userId, "どういたしまして！何かあればいつでもご連絡ください。");
-      } else {
-        // 通常のSlack通知（ファストリプライでない場合）
+      // 自動返信/マーク対象かチェック
+      let isAutoHandled = false;
+      
+      // パターンとマッチするか確認
+      for (const pattern of autoReplyPatterns) {
+        if (pattern.keywords.some(keyword => messageText.toLowerCase().includes(keyword.toLowerCase()))) {
+          if (pattern.reply) {
+            // 自動返信あり
+            await sendAutoReply(userId, pattern.reply);
+          } else {
+            // 自動返信なし、ただし返信済みとしてマーク
+            markAsReplied(userId);
+            logDebug(`ユーザー ${userId} のメッセージを自動的に返信済みとしてマークしました (キーワードマッチ)`);
+          }
+          isAutoHandled = true;
+          break;
+        }
+      }
+      
+      // 自動処理されなかった場合はSlack通知
+      if (!isAutoHandled) {
         await sendSlackInteractiveNotification(userId, messageLog[userId]);
       }
     }
@@ -392,6 +410,46 @@ app.post('/api/mark-as-replied', express.json(), (req, res) => {
   } else {
     res.status(404).json({ success: false, message: `ユーザー ${userId} の未返信メッセージは見つかりませんでした` });
   }
+});
+
+// Slackスラッシュコマンド用エンドポイント
+app.post('/slack/commands', express.urlencoded({ extended: true }), (req, res) => {
+  const { command, text, token, user_name } = req.body;
+  
+  logDebug(`Slackコマンド受信: ${command} ${text} from ${user_name}`);
+  
+  // /mark-replied コマンド
+  if (command === '/mark-replied') {
+    const userId = text.trim();
+    
+    if (!userId) {
+      return res.json({
+        response_type: 'ephemeral',
+        text: '⚠️ ユーザーIDが必要です。例: `/mark-replied USER_ID_HERE`'
+      });
+    }
+    
+    const success = markAsReplied(userId);
+    
+    if (success) {
+      logDebug(`Slackコマンド経由で ${userId} のメッセージを返信済みとしてマークしました`);
+      return res.json({
+        response_type: 'ephemeral',
+        text: `✅ ユーザー ${messageLog[userId].displayName} へのメッセージを返信済みとしてマークしました。`
+      });
+    } else {
+      return res.json({
+        response_type: 'ephemeral',
+        text: `⚠️ ユーザー ID: ${userId} の未返信メッセージは見つかりませんでした。`
+      });
+    }
+  }
+  
+  // 不明なコマンド
+  res.json({
+    response_type: 'ephemeral',
+    text: `不明なコマンドです: ${command}`
+  });
 });
 
 // 外部から返信を送信するエンドポイント
@@ -481,9 +539,10 @@ cron.schedule('* * * * *', async () => {
             'room': 'ルーム'
           }[user.sourceType] || '不明';
           
-          const markAsRepliedButton = `\n<http://line-reminder-bot-de113f80aa92.herokuapp.com/api/mark-as-replied?userId=${user.userId}|返信済みとしてマーク>`;
+          // ボタン形式ではなく、テキスト指示形式に変更
+          const markRepliedText = `\n\n返信済みにするには: \`/mark-replied ${user.userId}\` と入力してください。`;
           
-          return `*送信者*: ${user.name}\n*送信元*: ${sourceTypeText}\n*内容*: ${user.message.text}\n*メッセージID*: ${user.message.id}\n*経過時間*: ${user.elapsedMinutes}分${markAsRepliedButton}`;
+          return `*送信者*: ${user.name}\n*送信元*: ${sourceTypeText}\n*内容*: ${user.message.text}\n*メッセージID*: ${user.message.id}\n*経過時間*: ${user.elapsedMinutes}分${markRepliedText}`;
         }).join('\n\n');
         
         await sendSlackNotification(`*【1分以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`);
