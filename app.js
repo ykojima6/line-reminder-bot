@@ -354,6 +354,26 @@ async function handleEvent(event) {
   return Promise.resolve(null);
 }
 
+// 公式LINEで送信したボットのメッセージIDを検証して返信済みとマークするエンドポイント
+app.post('/api/verify-bot-reply', express.json(), async (req, res) => {
+  const { userId, botMessageId } = req.body;
+  if (!userId || !botMessageId) {
+    return res.status(400).json({ success: false, error: 'userId と botMessageId は必須です' });
+  }
+  
+  if (!conversations[userId]) {
+    return res.status(404).json({ success: false, error: `ユーザー ${userId} の会話が見つかりません` });
+  }
+  
+  if (conversations[userId].botReply && conversations[userId].botReply.id === botMessageId) {
+    conversations[userId].needsReply = false;
+    logDebug(`ユーザー ${userId} の会話を、botMessageId の検証により返信済みとマークしました`);
+    return res.status(200).json({ success: true, message: `ユーザー ${userId} の会話を返信済みとマークしました` });
+  } else {
+    return res.status(400).json({ success: false, error: '指定された botMessageId は記録されている返信と一致しません' });
+  }
+});
+
 // 外部から返信を送信するエンドポイント
 app.post('/api/send-reply', express.json(), async (req, res) => {
   const { userId, message } = req.body;
@@ -421,6 +441,15 @@ app.post('/api/mark-as-replied', express.json(), async (req, res) => {
     console.error('返信済みマークエラー:', error);
     res.status(500).json({ success: false, error: error.message });
   }
+});
+
+// すべての会話データを取得するエンドポイント
+app.get('/api/all-conversations', (req, res) => {
+  res.json({
+    success: true,
+    count: Object.keys(conversations).length,
+    conversations
+  });
 });
 
 // 1分ごとに未返信メッセージをチェックするスケジューラー
