@@ -14,6 +14,13 @@ const config = {
 // Slack Webhook URL (環境変数として設定)
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
 
+// Slack Webhook URLのチェック
+if (!SLACK_WEBHOOK_URL) {
+  console.warn('⚠️ SLACK_WEBHOOK_URLが設定されていません。Slack通知は機能しません。');
+} else {
+  console.log('Slack Webhook URL:', SLACK_WEBHOOK_URL.substring(0, 30) + '...');
+}
+
 // 指定された返信済みとみなすユーザーID
 const REPLY_USER_ID = process.env.REPLY_USER_ID || 'Ubf54091c82026dcfb8ede187814fdb9b';
 
@@ -56,6 +63,25 @@ app.get('/webhook', (req, res) => {
   res.send('LINE Bot Webhook is working. Please use POST method for actual webhook.');
 });
 
+// Slack通知のテスト用エンドポイント
+app.get('/test-slack', async (req, res) => {
+  try {
+    const result = await sendSlackNotification('これはSlack通知のテストメッセージです。時刻: ' + new Date().toLocaleString('ja-JP'));
+    res.json({
+      success: result,
+      message: result ? 'Slack通知を送信しました' : 'Slack通知の送信に失敗しました',
+      webhook_url_set: !!SLACK_WEBHOOK_URL,
+      webhook_url_preview: SLACK_WEBHOOK_URL ? SLACK_WEBHOOK_URL.substring(0, 30) + '...' : 'Not set'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      webhook_url_set: !!SLACK_WEBHOOK_URL
+    });
+  }
+});
+
 // デバッグ用ルート
 app.get('/debug', (req, res) => {
   // 安全なバージョンのメッセージ履歴を作成（ユーザーIDを隠す）
@@ -68,48 +94,88 @@ app.get('/debug', (req, res) => {
   const debugInfo = {
     messageCount: messageHistory.length,
     unrepliedCount: messageHistory.filter(msg => !msg.replied && msg.userId !== REPLY_USER_ID).length,
-    recentMessages: safeHistory.slice(-5) // 最新5件のメッセージ
+    recentMessages: safeHistory.slice(-5), // 最新5件のメッセージ
+    slack_webhook_url_set: !!SLACK_WEBHOOK_URL,
+    slack_webhook_url_preview: SLACK_WEBHOOK_URL ? SLACK_WEBHOOK_URL.substring(0, 30) + '...' : 'Not set'
   };
   res.json(debugInfo);
 });
 
-// Slackに通知を送信する関数
+// Slackに通知を送信する関数 (直接フェッチ使用)
 async function sendSlackNotification(message) {
   if (!SLACK_WEBHOOK_URL) {
-    console.log('Slack Webhook URLが設定されていないため、通知をスキップします');
+    console.log('❌ Slack Webhook URLが設定されていないため、通知をスキップします');
     return false;
   }
 
   try {
-    console.log('Slack通知を送信します:', message.substring(0, 100) + (message.length > 100 ? '...' : ''));
+    console.log('📤 Slack通知を送信します:', message.substring(0, 100) + (message.length > 100 ? '...' : ''));
     
-    // axiosのタイムアウトを設定
-    const response = await axios.post(SLACK_WEBHOOK_URL, { text: message }, {
-      timeout: 10000, // 10秒のタイムアウト
-      headers: {
-        'Content-Type': 'application/json'
-      }
+    // Axiosでリクエスト
+    const payload = JSON.stringify({ text: message });
+    console.log('送信するペイロード:', payload);
+    
+    // 詳細なリクエスト情報を表示
+    console.log('POST先URL:', SLACK_WEBHOOK_URL);
+    
+    const response = await axios({
+      method: 'post',
+      url: SLACK_WEBHOOK_URL,
+      data: { text: message },
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000 // 10秒タイムアウト
     });
     
-    console.log('Slack通知レスポンス:', response.status, response.statusText);
+    console.log('📬 Slack APIレスポンス:', {
+      status: response.status,
+      statusText: response.statusText,
+      data: response.data
+    });
     
     if (response.status >= 200 && response.status < 300) {
-      console.log('Slack通知を送信しました, ステータス:', response.status);
+      console.log('✅ Slack通知を送信しました, ステータス:', response.status);
       return true;
     } else {
-      console.error('Slack通知送信エラー - 不正なステータスコード:', response.status);
+      console.error('❌ Slack通知送信エラー - 不正なステータスコード:', response.status);
       return false;
     }
   } catch (error) {
-    console.error('Slack通知の送信に失敗しました:', error.message);
+    console.error('❌ Slack通知の送信に失敗しました:', error.message);
+    
     if (error.response) {
-      console.error('レスポンス:', error.response.status, error.response.data);
+      // サーバーからのレスポンスがあった場合
+      console.error('🔍 レスポンス詳細:', {
+        status: error.response.status,
+        headers: error.response.headers,
+        data: error.response.data
+      });
     } else if (error.request) {
-      console.error('リクエストは送信されましたが、レスポンスがありませんでした');
+      // リクエストは送信されたがレスポンスがなかった場合
+      console.error('🔍 リクエストは送信されましたが、レスポンスがありませんでした:', error.request);
     } else {
-      console.error('リクエスト設定中にエラーが発生しました');
+      // リクエスト作成時にエラーが発生した場合
+      console.error('🔍 リクエスト作成中にエラーが発生しました:', error.message);
     }
-    return false;
+    
+    // 別の方法でも試してみる（フェールバック）
+    try {
+      console.log('🔄 別の方法でSlack通知を試みます...');
+      const fetchResponse = await fetch(SLACK_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: message })
+      });
+      
+      console.log('🔄 代替方法の結果:', {
+        status: fetchResponse.status,
+        ok: fetchResponse.ok
+      });
+      
+      return fetchResponse.ok;
+    } catch (fetchError) {
+      console.error('❌ 代替方法も失敗しました:', fetchError.message);
+      return false;
+    }
   }
 }
 
@@ -216,6 +282,15 @@ async function handleEvent(event) {
       });
     }
     
+    // 特別コマンド: Slack通知テスト
+    if (messageText === 'slack-test' || messageText === 'slackテスト') {
+      const testResult = await sendSlackNotification(`*これはSlack通知のテストです*\n送信者: ${userDisplayName}\n時刻: ${new Date().toLocaleString('ja-JP')}`);
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: testResult ? 'Slackへの通知テストが成功しました！' : 'Slackへの通知テストが失敗しました。ログを確認してください。'
+      });
+    }
+    
     // 新しいメッセージを保存
     const newMessage = {
       chatId,
@@ -245,10 +320,11 @@ async function handleEvent(event) {
       const notificationText = `*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*送信時刻*: ${new Date(timestamp).toLocaleString('ja-JP')}`;
       
       try {
+        console.log('🔔 新規メッセージ通知を送信します...');
         const notificationSent = await sendSlackNotification(notificationText);
-        console.log('新規メッセージの通知状態:', notificationSent ? '成功' : '失敗');
+        console.log('🔔 新規メッセージの通知状態:', notificationSent ? '成功' : '失敗');
       } catch (error) {
-        console.error('通知送信中にエラーが発生しました:', error);
+        console.error('❌ 通知送信中にエラーが発生しました:', error);
       }
     } else {
       console.log(`自分からのメッセージを記録しました: ${messageText}`);
@@ -305,11 +381,13 @@ cron.schedule('* * * * *', async () => {
       }).join('\n\n');
       
       const notificationText = `*【1分以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`;
+      
+      console.log('⏰ リマインダー通知を送信します...');
       const notificationSent = await sendSlackNotification(notificationText);
       
-      console.log(`${unrepliedMessages.length}件のリマインダーをSlackに送信しました: ${notificationSent ? '成功' : '失敗'}`);
+      console.log(`⏰ ${unrepliedMessages.length}件のリマインダーをSlackに送信しました: ${notificationSent ? '成功' : '失敗'}`);
     } catch (error) {
-      console.error('Slackリマインダー送信エラー:', error);
+      console.error('❌ Slackリマインダー送信エラー:', error);
     }
   }
   
