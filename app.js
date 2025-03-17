@@ -11,6 +11,9 @@ const config = {
   channelSecret: process.env.LINE_CHANNEL_SECRET
 };
 
+// ボット自身のユーザーID - 明示的に除外するために設定
+const BOT_USER_ID = 'Ubf54091c82026dcfb8ede187814fdb9b'; // ログから特定したボットID
+
 // 環境変数の検証
 if (!process.env.LINE_CHANNEL_ACCESS_TOKEN || !process.env.LINE_CHANNEL_SECRET) {
   console.error('エラー: LINE_CHANNEL_ACCESS_TOKEN または LINE_CHANNEL_SECRET が設定されていません');
@@ -28,14 +31,28 @@ console.log('環境変数の状態:');
 console.log('LINE_CHANNEL_ACCESS_TOKEN exists:', !!process.env.LINE_CHANNEL_ACCESS_TOKEN);
 console.log('LINE_CHANNEL_SECRET exists:', !!process.env.LINE_CHANNEL_SECRET);
 console.log('SLACK_WEBHOOK_URL exists:', !!process.env.SLACK_WEBHOOK_URL);
+console.log('BOT_USER_ID:', BOT_USER_ID);
 
 // LINEクライアントを初期化
 const client = new line.Client(config);
 
 // 会話状態管理
 // ユーザーごとに未返信メッセージを追跡
-// { userId: { replyRequired: boolean, lastMessage: {text, timestamp, id}, displayName, sourceType } }
+// { userId: { messageText, timestamp, messageId, displayName, sourceType } }
 const pendingReplies = {};
+
+// デバッグ用ログ履歴
+const debugLogs = [];
+function logDebug(message) {
+  const timestamp = new Date().toISOString();
+  const logEntry = `${timestamp}: ${message}`;
+  console.log(logEntry);
+  debugLogs.unshift(logEntry); // 最新のログを先頭に
+  // 最大100件まで保存
+  if (debugLogs.length > 100) {
+    debugLogs.pop();
+  }
+}
 
 // 生のリクエストボディを取得するためのミドルウェア
 app.use('/webhook', express.raw({ type: 'application/json' }));
@@ -57,14 +74,14 @@ app.get('/webhook', (req, res) => {
 // Slackに通知を送信する関数
 async function sendSlackNotification(message) {
   if (!SLACK_WEBHOOK_URL) {
-    console.log('Slack Webhook URLが設定されていないため、通知をスキップします');
+    logDebug('Slack Webhook URLが設定されていないため、通知をスキップします');
     return;
   }
 
   try {
-    console.log('Slack通知を送信します:', message.substring(0, 100) + (message.length > 100 ? '...' : ''));
+    logDebug('Slack通知を送信します: ' + message.substring(0, 100) + (message.length > 100 ? '...' : ''));
     const response = await axios.post(SLACK_WEBHOOK_URL, { text: message });
-    console.log('Slack通知を送信しました, ステータス:', response.status);
+    logDebug('Slack通知を送信しました, ステータス: ' + response.status);
   } catch (error) {
     console.error('Slack通知の送信に失敗しました:', error.message);
     if (error.response) {
@@ -76,7 +93,12 @@ async function sendSlackNotification(message) {
 // ユーザーへの返信をマークする関数
 function markAsReplied(userId) {
   if (pendingReplies[userId]) {
-    console.log(`ユーザー ${userId} の会話を返信済みとしてマークします`);
+    logDebug(`ユーザー ${userId} の会話を返信済みとしてマークします`);
+    
+    // 返信済みメッセージの情報を保存（デバッグ用）
+    const repliedMessage = pendingReplies[userId];
+    logDebug(`返信済みメッセージ: ${JSON.stringify(repliedMessage)}`);
+    
     // ユーザーを未返信リストから削除
     delete pendingReplies[userId];
     return true;
@@ -88,10 +110,12 @@ function markAsReplied(userId) {
 async function replyToUser(event, message) {
   try {
     // LINE APIを使ってメッセージを返信
-    await client.replyMessage(event.replyToken, {
+    const result = await client.replyMessage(event.replyToken, {
       type: 'text',
       text: message
     });
+    
+    logDebug(`メッセージを返信しました: ${message}`);
     
     // 返信後、そのユーザーを未返信リストから削除
     markAsReplied(event.source.userId);
@@ -112,6 +136,8 @@ async function pushMessageToUser(userId, message) {
       text: message
     });
     
+    logDebug(`プッシュメッセージを送信しました: ${userId} - ${message}`);
+    
     // 送信後、そのユーザーを未返信リストから削除
     markAsReplied(userId);
     
@@ -129,7 +155,7 @@ app.post('/webhook', (req, res) => {
   
   // 署名がなければ400エラー
   if (!signature) {
-    console.log('署名がありません');
+    logDebug('署名がありません');
     return res.status(400).send('署名がありません');
   }
   
@@ -142,19 +168,19 @@ app.post('/webhook', (req, res) => {
   const digestFromBody = hmac.update(bodyStr).digest('base64');
   
   if (digestFromBody !== signature) {
-    console.log('署名が一致しません');
-    console.log('Expected:', digestFromBody);
-    console.log('Received:', signature);
+    logDebug('署名が一致しません');
+    logDebug('Expected: ' + digestFromBody);
+    logDebug('Received: ' + signature);
     return res.status(400).send('署名が一致しません');
   }
   
   // リクエストボディをパース
   const parsedBody = Buffer.isBuffer(body) ? JSON.parse(body.toString()) : body;
-  console.log('Webhook received:', JSON.stringify(parsedBody).substring(0, 500) + '...');
+  logDebug('Webhook received: ' + JSON.stringify(parsedBody).substring(0, 500) + '...');
   
   // イベント処理
   if (!parsedBody || !parsedBody.events || !Array.isArray(parsedBody.events)) {
-    console.log('不正なリクエストボディ:', parsedBody);
+    logDebug('不正なリクエストボディ: ' + JSON.stringify(parsedBody));
     return res.status(400).send('不正なリクエストボディ');
   }
   
@@ -170,7 +196,7 @@ app.post('/webhook', (req, res) => {
 
 // イベントハンドラー
 async function handleEvent(event) {
-  console.log('イベント処理:', event.type);
+  logDebug('イベント処理: ' + event.type + ' - イベントID: ' + (event.webhookEventId || 'なし'));
   
   // メッセージイベント以外は無視
   if (event.type !== 'message' || event.message.type !== 'text') {
@@ -178,6 +204,17 @@ async function handleEvent(event) {
   }
 
   try {
+    const userId = event.source.userId;
+    const messageText = event.message.text;
+    const messageId = event.message.id;
+    const timestamp = event.timestamp;
+    
+    // ボットからのメッセージをスキップ
+    if (userId === BOT_USER_ID) {
+      logDebug(`ボット自身(${BOT_USER_ID})のメッセージなのでスキップします: ${messageText}`);
+      return Promise.resolve(null);
+    }
+    
     // 送信者情報を取得
     let senderProfile;
     try {
@@ -193,13 +230,9 @@ async function handleEvent(event) {
       senderProfile = { displayName: 'Unknown User' };
     }
 
-    const userId = event.source.userId;
     const userDisplayName = senderProfile ? senderProfile.displayName : 'Unknown User';
     const sourceType = event.source.type;
-    const messageId = event.message.id;
-    const messageText = event.message.text;
-    const timestamp = event.timestamp;
-    
+
     // 特別コマンド処理: すべて返信済みにする
     if (messageText === '全部返信済み' || messageText === 'すべて返信済み') {
       markAsReplied(userId);
@@ -216,9 +249,20 @@ async function handleEvent(event) {
       const statusMessage = needsReply 
         ? "現在、あなたへの返信が必要なメッセージがあります。"
         : "現在、あなたへの未返信メッセージはありません。";
-        
+      
+      logDebug(`ステータスチェック: ユーザー ${userId} の返信状態: ${needsReply ? '未返信あり' : '未返信なし'}`);
+      
       // 返信を送信し、送信後に返信済みとマーク
       return replyToUser(event, statusMessage);
+    }
+    
+    // 特別コマンド処理: デバッグログ
+    if (messageText === 'デバッグログ' || messageText === 'debuglog') {
+      const pendingCount = Object.keys(pendingReplies).length;
+      const logMessage = `*デバッグ情報*\n未返信ユーザー数: ${pendingCount}\n\n最新のログ（最大10件）:\n${debugLogs.slice(0, 10).join('\n')}`;
+      
+      // 返信を送信し、送信後に返信済みとマーク
+      return replyToUser(event, logMessage);
     }
     
     // ユーザーからのメッセージを記録
@@ -230,7 +274,8 @@ async function handleEvent(event) {
       sourceType: sourceType
     };
     
-    console.log(`ユーザー${userId}からのメッセージを未返信として記録しました:`, messageText);
+    logDebug(`ユーザー${userId}からのメッセージを未返信として記録しました: ${messageText}`);
+    logDebug(`現在の未返信ユーザー数: ${Object.keys(pendingReplies).length}`);
     
     // Slackに通知を送信
     const sourceTypeText = {
@@ -260,6 +305,7 @@ app.post('/api/mark-as-replied', express.json(), (req, res) => {
   const success = markAsReplied(userId);
   
   if (success) {
+    logDebug(`API経由で ${userId} のメッセージを返信済みとしてマークしました`);
     res.status(200).json({ success: true, message: `ユーザー ${userId} のメッセージを返信済みとしてマークしました` });
   } else {
     res.status(404).json({ success: false, message: `ユーザー ${userId} の未返信メッセージは見つかりませんでした` });
@@ -293,12 +339,12 @@ let isCheckingUnreplied = false; // 実行中フラグ
 cron.schedule('* * * * *', async () => {
   // 前回の実行が完了していない場合はスキップ
   if (isCheckingUnreplied) {
-    console.log('前回の未返信チェックが進行中のためスキップします');
+    logDebug('前回の未返信チェックが進行中のためスキップします');
     return;
   }
   
   isCheckingUnreplied = true;
-  console.log('1分間隔の未返信チェック実行中...', new Date().toISOString());
+  logDebug('1分間隔の未返信チェック実行中...');
   
   try {
     const now = Date.now();
@@ -308,6 +354,13 @@ cron.schedule('* * * * *', async () => {
     
     // すべての未返信メッセージをチェック
     for (const userId in pendingReplies) {
+      // ボットユーザーIDをスキップ
+      if (userId === BOT_USER_ID) {
+        logDebug(`ボット自身(${BOT_USER_ID})のメッセージなのでリマインダーをスキップします`);
+        delete pendingReplies[userId]; // ボットのメッセージを削除
+        continue;
+      }
+      
       const userInfo = pendingReplies[userId];
       const elapsedTime = now - userInfo.timestamp;
       const elapsedMinutes = Math.floor(elapsedTime / (60 * 1000));
@@ -326,7 +379,7 @@ cron.schedule('* * * * *', async () => {
       }
     }
     
-    console.log(`未返信ユーザー数: ${unrepliedUsers.length}`);
+    logDebug(`未返信ユーザー数: ${unrepliedUsers.length}`);
     
     // Slackにリマインダーを送信
     if (unrepliedUsers.length > 0) {
@@ -343,7 +396,7 @@ cron.schedule('* * * * *', async () => {
         
         await sendSlackNotification(`*【1分以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`);
         
-        console.log(`${unrepliedUsers.length}件のリマインダーをSlackに送信しました`);
+        logDebug(`${unrepliedUsers.length}件のリマインダーをSlackに送信しました`);
       } catch (error) {
         console.error('Slackリマインダー送信エラー:', error);
       }
@@ -365,8 +418,17 @@ app.get('/api/pending-replies', (req, res) => {
   });
 });
 
+// デバッグログを表示するエンドポイント
+app.get('/api/debug-logs', (req, res) => {
+  res.json({
+    success: true,
+    count: debugLogs.length,
+    logs: debugLogs
+  });
+});
+
 // サーバー起動
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  logDebug(`Server running on port ${PORT}`);
 });
