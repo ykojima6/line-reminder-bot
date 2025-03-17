@@ -3,6 +3,10 @@ const line = require('@line/bot-sdk');
 const cron = require('node-cron');
 const app = express();
 
+console.log('環境変数の状態:');
+console.log('LINE_CHANNEL_ACCESS_TOKEN exists:', !!process.env.LINE_CHANNEL_ACCESS_TOKEN);
+console.log('LINE_CHANNEL_SECRET exists:', !!process.env.LINE_CHANNEL_SECRET);
+
 // LINE API設定
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
