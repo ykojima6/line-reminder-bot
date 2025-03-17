@@ -23,10 +23,12 @@ console.log('SLACK_WEBHOOK_URL exists:', !!process.env.SLACK_WEBHOOK_URL);
 // LINEクライアントを初期化
 const client = new line.Client(config);
 
-// パターンを変更: メッセージを保持する代わりに、最後の通信情報のみを保持
-// { userId: { lastTimestamp, awaitingReply } }
-// awaitingReply = false の場合、リマインドが不要
-const userStates = {};
+// 会話状態管理: ユーザーごとに最後のメッセージが自分（ボット）からかユーザーからかを保存
+// { userId: { lastMessageFromUser: boolean, lastTimestamp, lastMessage } }
+const conversations = {};
+
+// ボットのユーザーID（取得できない場合は空文字で対応）
+const BOT_USER_ID = ''; // もし可能なら取得する
 
 // 生のリクエストボディを取得するためのミドルウェア
 app.use('/webhook', express.raw({ type: 'application/json' }));
@@ -141,13 +143,14 @@ async function handleEvent(event) {
     const messageText = event.message.text;
     const timestamp = event.timestamp;
     
-    // 特別コマンド: すべて返信済みにする
+    // 特別コマンド処理: すべて返信済みにする
     if (messageText === '全部返信済み' || messageText === 'すべて返信済み') {
-      if (userStates[userId]) {
-        userStates[userId].awaitingReply = false;
+      if (conversations[userId]) {
+        // 最後のメッセージがボットからのものとしてマーク
+        conversations[userId].lastMessageFromUser = false;
       }
       
-      await sendSlackNotification(`*すべて返信済みにしました*\n*ユーザー*: ${userDisplayName}\nこのユーザーの未返信状態をクリアしました。`);
+      await sendSlackNotification(`*すべて返信済みにしました*\n*ユーザー*: ${userDisplayName}\nこのユーザーへの未返信状態をクリアしました。`);
       
       return client.replyMessage(event.replyToken, {
         type: 'text',
@@ -155,11 +158,15 @@ async function handleEvent(event) {
       });
     }
     
-    // ユーザーの状態を確認・初期化
-    if (!userStates[userId]) {
-      userStates[userId] = {
+    // 送信元がユーザーかボットか判定
+    const isFromUser = userId !== BOT_USER_ID;
+    
+    // 会話状態を更新
+    if (!conversations[userId]) {
+      // 初めてのメッセージ
+      conversations[userId] = {
+        lastMessageFromUser: isFromUser,
         lastTimestamp: timestamp,
-        awaitingReply: false,  // 初回メッセージでは返信不要
         lastMessage: {
           text: messageText,
           id: messageId
@@ -168,20 +175,10 @@ async function handleEvent(event) {
         sourceType: sourceType
       };
     } else {
-      // 既存ユーザーの場合、メッセージ受信で状態を更新
-      
-      // 現在の状態を保存
-      const wasAwaitingReply = userStates[userId].awaitingReply;
-      const prevMessage = userStates[userId].lastMessage;
-      
-      // ユーザーからの新しいメッセージが来た場合
-      // - メッセージを保存
-      // - 「返信待ち」の状態をトグル（falseならtrue、trueならfalse）
-      
-      // 状態を更新
-      userStates[userId] = {
+      // 会話状態を更新
+      conversations[userId] = {
+        lastMessageFromUser: isFromUser,
         lastTimestamp: timestamp,
-        awaitingReply: !wasAwaitingReply,  // トグル: falseならtrue、trueならfalse
         lastMessage: {
           text: messageText,
           id: messageId
@@ -189,16 +186,9 @@ async function handleEvent(event) {
         displayName: userDisplayName,
         sourceType: sourceType
       };
-      
-      // もし前回が「返信待ち」だった場合、それを返信済みにした旨を記録
-      if (wasAwaitingReply) {
-        await sendSlackNotification(`*返信完了*\n*ユーザー*: ${userDisplayName}\n*元のメッセージ*: ${prevMessage?.text || 'Unknown'}\n*返信内容*: ${messageText}`);
-        console.log(`ユーザー${userId}の返信を記録しました`);
-      }
     }
     
-    // 現在の状態をログ出力
-    console.log(`ユーザー${userId}の状態:`, JSON.stringify(userStates[userId]));
+    console.log(`ユーザー${userId}の会話状態:`, JSON.stringify(conversations[userId]));
     
     // Slackに通知を送信
     const sourceTypeText = {
@@ -207,7 +197,15 @@ async function handleEvent(event) {
       'room': 'ルーム'
     }[sourceType] || '不明';
     
-    await sendSlackNotification(`*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*メッセージID*: ${messageId}\n*返信待ちになりましたか*: ${userStates[userId].awaitingReply ? 'はい' : 'いいえ'}`);
+    // ユーザーからのメッセージの場合のみ通知
+    if (isFromUser) {
+      await sendSlackNotification(`*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*メッセージID*: ${messageId}`);
+    }
+    
+    // ボットからの返信の場合
+    if (!isFromUser) {
+      console.log(`ボットからの返信を記録しました: ${messageText}`);
+    }
     
   } catch (error) {
     console.error('メッセージ処理エラー:', error);
@@ -226,21 +224,21 @@ cron.schedule('* * * * *', async () => {
   let unrepliedUsers = [];
   
   // すべてのユーザーの状態をチェック
-  for (const userId in userStates) {
-    const state = userStates[userId];
+  for (const userId in conversations) {
+    const convo = conversations[userId];
     
-    // 「返信待ち」かつ1分以上経過している場合
-    if (state.awaitingReply) {
-      const elapsedTime = now - state.lastTimestamp;
+    // 最後のメッセージがユーザーからのもので、1分以上経過している場合
+    if (convo.lastMessageFromUser) {
+      const elapsedTime = now - convo.lastTimestamp;
       const elapsedMinutes = Math.floor(elapsedTime / (60 * 1000));
       
       if (elapsedTime >= oneMinuteInMs) {
         unrepliedUsers.push({
           userId,
-          name: state.displayName,
-          message: state.lastMessage,
+          name: convo.displayName,
+          message: convo.lastMessage,
           elapsedMinutes,
-          sourceType: state.sourceType
+          sourceType: convo.sourceType
         });
       }
     }
