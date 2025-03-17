@@ -244,7 +244,7 @@ cron.schedule('* * * * *', async () => {
     }
   }
   
-  console.log(未返信ユーザー数: ${unrepliedUsers.length});
+  console.log(`未返信ユーザー数: ${unrepliedUsers.length}`);
   
   // Slackにリマインダーを送信
   if (unrepliedUsers.length > 0) {
