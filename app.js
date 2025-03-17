@@ -90,9 +90,70 @@ function markAsReplied(userId) {
   if (messageLog[userId] && messageLog[userId].needsReply) {
     logDebug(`ユーザー ${userId} の会話を返信済みとしてマークします`);
     messageLog[userId].needsReply = false;
+    // 返信が行われた時間を記録
+    messageLog[userId].repliedAt = Date.now();
     return true;
   }
   return false;
+}
+
+// Slackにボタン付き通知を送信する関数
+async function sendSlackInteractiveNotification(userId, userInfo) {
+  try {
+    const sourceTypeText = {
+      'user': '個別チャット',
+      'group': 'グループ',
+      'room': 'ルーム'
+    }[userInfo.sourceType] || '不明';
+    
+    // Slackに通知を送信する
+    const message = {
+      text: `*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userInfo.displayName}\n*内容*: ${userInfo.messageText}\n*メッセージID*: ${userInfo.messageId}`,
+      attachments: [
+        {
+          text: "このメッセージに対するアクション:",
+          fallback: "返信済みとしてマークするボタンを表示できません",
+          callback_id: "message_actions",
+          actions: [
+            {
+              name: "mark_replied",
+              text: "返信済みとしてマーク",
+              type: "button",
+              value: userId
+            }
+          ]
+        }
+      ]
+    };
+    
+    const response = await axios.post(SLACK_WEBHOOK_URL, message);
+    logDebug(`Slackにインタラクティブ通知を送信しました, ステータス: ${response.status}`);
+  } catch (error) {
+    console.error('Slackインタラクティブ通知の送信に失敗しました:', error.message);
+    // 通常の通知にフォールバック
+    await sendSlackNotification(`*新規メッセージ*\n*送信元*: ${userInfo.sourceType}\n*送信者*: ${userInfo.displayName}\n*内容*: ${userInfo.messageText}\n*メッセージID*: ${userInfo.messageId}`);
+  }
+}
+
+// 自動応答機能
+async function sendAutoReply(userId, replyText) {
+  try {
+    await client.pushMessage(userId, {
+      type: 'text',
+      text: replyText
+    });
+    
+    logDebug(`ユーザー ${userId} に自動応答を送信しました: ${replyText}`);
+    markAsReplied(userId);
+    
+    // Slackに通知
+    await sendSlackNotification(`*自動応答送信*\n*ユーザー*: ${messageLog[userId].displayName}\n*内容*: ${replyText}`);
+    
+    return true;
+  } catch (error) {
+    console.error('自動応答送信エラー:', error);
+    return false;
+  }
 }
 
 // LINE Bot用Webhookルート - カスタム署名検証
@@ -156,7 +217,7 @@ async function handleEvent(event) {
     const messageId = event.message.id;
     const timestamp = event.timestamp;
     
-    // replyTokenの有無でボットからの送信かを判断
+    // replyTokenの有無でユーザーからの送信かを判断
     // webhookイベントはユーザーからの送信を表し、replyTokenが付与される
     const isFromUser = !!event.replyToken;
     
@@ -179,9 +240,25 @@ async function handleEvent(event) {
 
     const userDisplayName = senderProfile ? senderProfile.displayName : 'Unknown User';
     const sourceType = event.source.type;
+    
+    // 緊急事態コマンド: すべてリセット
+    if (isFromUser && messageText === 'リセット') {
+      // 全ユーザーの状態をリセット
+      Object.keys(messageLog).forEach(uid => {
+        messageLog[uid].needsReply = false;
+      });
+      
+      await sendSlackNotification(`*システムリセット*\n*ユーザー*: ${userDisplayName}\nすべてのユーザーの未返信状態をリセットしました。`);
+      
+      // 返信を送信
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: "システムをリセットしました。すべての未返信状態がクリアされました。"
+      });
+    }
 
     // 特別コマンド処理: すべて返信済みにする
-    if (isFromUser && (messageText === '全部返信済み' || messageText === 'すべて返信済み')) {
+    if (isFromUser && (messageText === '全部返信済み' || messageText === 'すべて返信済み' || messageText === '返信済み')) {
       markAsReplied(userId);
       
       await sendSlackNotification(`*すべて返信済みにしました*\n*ユーザー*: ${userDisplayName}\nこのユーザーへの未返信状態をクリアしました。`);
@@ -196,9 +273,14 @@ async function handleEvent(event) {
     // 特別コマンド処理: ステータスチェック
     if (isFromUser && (messageText === 'ステータス' || messageText === 'status')) {
       const needsReply = messageLog[userId] && messageLog[userId].needsReply;
-      const statusMessage = needsReply 
-        ? "現在、あなたへの返信が必要なメッセージがあります。"
-        : "現在、あなたへの未返信メッセージはありません。";
+      let statusMessage;
+      
+      if (needsReply) {
+        const lastMessageTime = new Date(messageLog[userId].timestamp).toLocaleString('ja-JP');
+        statusMessage = `現在、あなたの未返信メッセージがあります。\n\n最後のメッセージ: "${messageLog[userId].messageText}"\n時間: ${lastMessageTime}`;
+      } else {
+        statusMessage = "現在、あなたへの未返信メッセージはありません。";
+      }
       
       logDebug(`ステータスチェック: ユーザー ${userId} の返信状態: ${needsReply ? '未返信あり' : '未返信なし'}`);
       
@@ -228,28 +310,29 @@ async function handleEvent(event) {
       });
     }
     
-    // メッセージを記録
-    messageLog[userId] = {
-      messageText: messageText,
-      timestamp: timestamp,
-      messageId: messageId,
-      displayName: userDisplayName,
-      sourceType: sourceType,
-      needsReply: isFromUser // ユーザーからのメッセージのみ返信が必要
-    };
-    
-    logDebug(`ユーザー${userId}のメッセージを記録しました: ${messageText}, 返信必要=${isFromUser}`);
-    
-    // ユーザーからのメッセージのみSlackに通知
+    // ユーザーからのメッセージのみ記録して処理
     if (isFromUser) {
-      const sourceTypeText = {
-        'user': '個別チャット',
-        'group': 'グループ',
-        'room': 'ルーム'
-      }[sourceType] || '不明';
+      // メッセージを記録
+      messageLog[userId] = {
+        messageText: messageText,
+        timestamp: timestamp,
+        messageId: messageId,
+        displayName: userDisplayName,
+        sourceType: sourceType,
+        needsReply: true // ユーザーからのメッセージは返信が必要
+      };
       
-      // Slackに通知を送信
-      await sendSlackNotification(`*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*メッセージID*: ${messageId}`);
+      logDebug(`ユーザー${userId}のメッセージを記録しました: ${messageText}, 返信必要=true`);
+      
+      // ファストリプライ対象かチェック（自動応答）
+      if (messageText.includes('ありがと') || messageText.includes('thanks') || 
+          messageText.includes('thank you') || messageText.includes('サンキュ')) {
+        // お礼への自動応答
+        await sendAutoReply(userId, "どういたしまして！何かあればいつでもご連絡ください。");
+      } else {
+        // 通常のSlack通知（ファストリプライでない場合）
+        await sendSlackInteractiveNotification(userId, messageLog[userId]);
+      }
     }
     
   } catch (error) {
@@ -258,6 +341,40 @@ async function handleEvent(event) {
 
   return Promise.resolve(null);
 }
+
+// Slack対話用エンドポイント
+app.post('/slack/actions', express.urlencoded({ extended: true }), async (req, res) => {
+  // Slackからのペイロードを取得
+  const payload = JSON.parse(req.body.payload);
+  
+  logDebug(`Slackアクション受信: ${payload.callback_id}`);
+  
+  // アクションタイプに応じて処理
+  if (payload.callback_id === 'message_actions') {
+    const action = payload.actions[0];
+    
+    if (action.name === 'mark_replied') {
+      const userId = action.value;
+      const success = markAsReplied(userId);
+      
+      // Slackに応答
+      if (success) {
+        logDebug(`Slack経由で ${userId} のメッセージを返信済みとしてマークしました`);
+        res.json({
+          text: `✅ ユーザー ${messageLog[userId].displayName} へのメッセージを返信済みとしてマークしました。`,
+          replace_original: false
+        });
+      } else {
+        res.json({
+          text: `⚠️ ユーザー ID: ${userId} の未返信メッセージは見つかりませんでした。`,
+          replace_original: false
+        });
+      }
+    }
+  } else {
+    res.status(200).end(); // 不明なアクションの場合は単に応答する
+  }
+});
 
 // 外部からの返信マーク用エンドポイント
 app.post('/api/mark-as-replied', express.json(), (req, res) => {
@@ -274,6 +391,38 @@ app.post('/api/mark-as-replied', express.json(), (req, res) => {
     res.status(200).json({ success: true, message: `ユーザー ${userId} のメッセージを返信済みとしてマークしました` });
   } else {
     res.status(404).json({ success: false, message: `ユーザー ${userId} の未返信メッセージは見つかりませんでした` });
+  }
+});
+
+// 外部から返信を送信するエンドポイント
+app.post('/api/send-reply', express.json(), async (req, res) => {
+  const { userId, message } = req.body;
+  
+  if (!userId || !message) {
+    return res.status(400).json({ success: false, error: 'ユーザーIDとメッセージが必要です' });
+  }
+  
+  try {
+    // メッセージを送信
+    await client.pushMessage(userId, {
+      type: 'text',
+      text: message
+    });
+    
+    // 返信済みとしてマーク
+    const marked = markAsReplied(userId);
+    
+    logDebug(`API経由でユーザー ${userId} にメッセージを送信し、返信済みとしてマークしました`);
+    
+    res.status(200).json({ 
+      success: true, 
+      messageSent: true,
+      markedAsReplied: marked,
+      message: `ユーザー ${userId} にメッセージを送信しました` 
+    });
+  } catch (error) {
+    console.error('メッセージ送信エラー:', error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -332,7 +481,9 @@ cron.schedule('* * * * *', async () => {
             'room': 'ルーム'
           }[user.sourceType] || '不明';
           
-          return `*送信者*: ${user.name}\n*送信元*: ${sourceTypeText}\n*内容*: ${user.message.text}\n*メッセージID*: ${user.message.id}\n*経過時間*: ${user.elapsedMinutes}分`;
+          const markAsRepliedButton = `\n<http://line-reminder-bot-de113f80aa92.herokuapp.com/api/mark-as-replied?userId=${user.userId}|返信済みとしてマーク>`;
+          
+          return `*送信者*: ${user.name}\n*送信元*: ${sourceTypeText}\n*内容*: ${user.message.text}\n*メッセージID*: ${user.message.id}\n*経過時間*: ${user.elapsedMinutes}分${markAsRepliedButton}`;
         }).join('\n\n');
         
         await sendSlackNotification(`*【1分以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`);
@@ -347,6 +498,29 @@ cron.schedule('* * * * *', async () => {
   } finally {
     isCheckingUnreplied = false; // 処理完了フラグ
   }
+});
+
+// 古いデータをクリーンアップするスケジューラー（6時間ごと）
+cron.schedule('0 */6 * * *', () => {
+  logDebug('古いメッセージデータをクリーンアップしています...');
+  
+  const now = Date.now();
+  const oneDayInMs = 24 * 60 * 60 * 1000; // 1日をミリ秒に変換
+  
+  let cleanupCount = 0;
+  
+  // 返信済みで1日以上経過したメッセージをクリーンアップ
+  for (const userId in messageLog) {
+    const message = messageLog[userId];
+    
+    // 返信済みで1日以上経過
+    if (!message.needsReply && message.repliedAt && (now - message.repliedAt > oneDayInMs)) {
+      delete messageLog[userId];
+      cleanupCount++;
+    }
+  }
+  
+  logDebug(`${cleanupCount}件の古いメッセージをクリーンアップしました`);
 });
 
 // 現在のメッセージ状態を表示するエンドポイント
@@ -374,6 +548,25 @@ app.get('/api/debug-logs', (req, res) => {
     count: debugLogs.length,
     logs: debugLogs
   });
+});
+
+// GET形式による返信済みマーク
+app.get('/api/mark-as-replied', (req, res) => {
+  const userId = req.query.userId;
+  
+  if (!userId) {
+    return res.status(400).send('ユーザーIDが必要です');
+  }
+  
+  const success = markAsReplied(userId);
+  
+  if (success) {
+    const userName = messageLog[userId] ? messageLog[userId].displayName : 'Unknown User';
+    logDebug(`Web経由で ${userId} (${userName}) のメッセージを返信済みとしてマークしました`);
+    res.send(`<html><body><h1>✅ 成功</h1><p>ユーザー ${userName} へのメッセージを返信済みとしてマークしました。</p><p><a href="javascript:window.close();">このウィンドウを閉じる</a></p></body></html>`);
+  } else {
+    res.send(`<html><body><h1>⚠️ エラー</h1><p>ユーザー ID: ${userId} の未返信メッセージは見つかりませんでした。</p><p><a href="javascript:window.close();">このウィンドウを閉じる</a></p></body></html>`);
+  }
 });
 
 // サーバー起動
