@@ -261,7 +261,7 @@ cron.schedule('* * * * *', async () => {
       
       await sendSlackNotification('*【1分以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}');
       
-      console.log(${unrepliedUsers.length}件のリマインダーをSlackに送信しました);
+      console.log(`${unrepliedUsers.length}件のリマインダーをSlackに送信しました`);
     } catch (error) {
       console.error('Slackリマインダー送信エラー:', error);
     }
