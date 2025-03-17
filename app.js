@@ -211,9 +211,14 @@ async function handleEvent(event) {
 // 5分ごとに未返信メッセージをチェックするスケジューラー
 // cron式: '*/5 * * * *' は5分ごとに実行
 cron.schedule('*/5 * * * *', async () => {
-  console.log('5分間隔の未返信チェック実行中...');
+  console.log('5分間隔の未返信チェック実行中...', new Date().toISOString());
   const now = Date.now();
   const fiveMinutesInMs = 5 * 60 * 1000;
+  
+  // デバッグログ - メッセージストアの状態確認
+  console.log('現在のメッセージストア状態:', JSON.stringify(messageStore, null, 2));
+  
+  let totalUnrepliedCount = 0;
   
   // 各ユーザーのメッセージをチェック
   for (const userId in messageStore) {
@@ -225,9 +230,12 @@ cron.schedule('*/5 * * * *', async () => {
       const message = userMessages[messageId];
       const elapsedTime = now - message.timestamp;
       
-      // 5分以上12時間未満の未返信メッセージをチェック（12時間以上は別のスケジューラーで処理）
+      console.log(`メッセージID: ${messageId}, 返信済み: ${message.replied}, 経過時間: ${Math.floor(elapsedTime / (60 * 1000))}分`);
+      
+      // 5分以上12時間未満の未返信メッセージをチェック
       if (!message.replied && elapsedTime >= fiveMinutesInMs && elapsedTime < 12 * 60 * 60 * 1000) {
         unrepliedMessages.push(message);
+        totalUnrepliedCount++;
       }
     }
     
@@ -238,6 +246,8 @@ cron.schedule('*/5 * * * *', async () => {
           `*送信者*: ${msg.senderName}\n*内容*: ${msg.text}\n*メッセージID*: ${msg.messageId}\n*経過時間*: ${Math.floor((now - msg.timestamp) / (60 * 1000))}分`
         ).join('\n\n');
         
+        console.log('Slackにリマインダーを送信します:', reminderText);
+        
         await sendSlackNotification(`*【5分経過リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`);
         
         console.log(`${unrepliedMessages.length}件の5分リマインダーをSlackに送信しました`);
@@ -246,6 +256,8 @@ cron.schedule('*/5 * * * *', async () => {
       }
     }
   }
+  
+  console.log(`5分チェック完了: 合計${totalUnrepliedCount}件の未返信メッセージを検出`);
 });
 
 // 12時間ごとに未返信メッセージをチェックするスケジューラー
