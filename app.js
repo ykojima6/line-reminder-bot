@@ -204,7 +204,7 @@ async function handleEvent(event) {
     
     // ボットからの返信の場合
     if (!isFromUser) {
-      console.log(ボットからの返信を記録しました: ${messageText});
+      console.log(`ボットからの返信を記録しました: ${messageText}`);
     }
     
   } catch (error) {
