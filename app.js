@@ -2,7 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const line = require('@line/bot-sdk');
 const cron = require('node-cron');
-const axios = require('axios'); // Slackへの通知に使用
+const axios = require('axios');
 const app = express();
 
 // LINE API設定
@@ -116,90 +116,85 @@ async function handleEvent(event) {
     return Promise.resolve(null);
   }
 
-  // グループまたはルームからのメッセージの場合（公式アカウントからの可能性）
-  if (event.source.type === 'room' || event.source.type === 'group') {
+  try {
+    // 送信者情報を取得
+    let senderProfile;
     try {
-      // 送信者情報を取得（グループの場合）
-      let senderProfile;
       if (event.source.type === 'room') {
         senderProfile = await client.getRoomMemberProfile(event.source.roomId, event.source.userId);
       } else if (event.source.type === 'group') {
         senderProfile = await client.getGroupMemberProfile(event.source.groupId, event.source.userId);
-      }
-      
-      // 公式アカウントかどうかの判定（実際にはAPIで公式アカウントかを判断する必要があります）
-      // ここでは例として、表示名に【公式】が含まれているかどうかで判断します
-      const isOfficialAccount = senderProfile && senderProfile.displayName.includes('【公式】');
-      
-      if (isOfficialAccount) {
-        // メッセージを送信したユーザーID（自分自身のユーザーID）
-        const myUserId = event.source.userId;
-        
-        // メッセージを保存
-        if (!messageStore[myUserId]) {
-          messageStore[myUserId] = {};
-        }
-        
-        messageStore[myUserId][event.message.id] = {
-          text: event.message.text,
-          sender: event.source.userId,
-          senderName: senderProfile.displayName,
-          timestamp: event.timestamp,
-          replied: false,
-          messageId: event.message.id
-        };
-        
-        console.log(`公式アカウントからのメッセージを保存: ${event.message.text}`);
-        
-        // Slackに通知を送信
-        await sendSlackNotification(`*新規メッセージ*\n*送信者*: ${senderProfile.displayName}\n*内容*: ${event.message.text}\n*メッセージID*: ${event.message.id}`);
+      } else if (event.source.type === 'user') {
+        senderProfile = await client.getProfile(event.source.userId);
       }
     } catch (error) {
-      console.error('メッセージ処理エラー:', error);
+      console.log('プロフィール取得エラー:', error.message);
+      // プロフィールが取得できない場合はデフォルト値を設定
+      senderProfile = { displayName: 'Unknown User' };
     }
-  }
-  
-  // 個別のチャットからのメッセージの場合
-  if (event.source.type === 'user') {
-    try {
-      // ユーザープロフィール取得
-      const userProfile = await client.getProfile(event.source.userId);
+
+    // メッセージを送信したユーザーID（自分自身のユーザーID）
+    const myUserId = event.source.userId;
+    
+    // メッセージを保存（すべてのメッセージを対象にする）
+    if (!messageStore[myUserId]) {
+      messageStore[myUserId] = {};
+    }
+    
+    messageStore[myUserId][event.message.id] = {
+      text: event.message.text,
+      sender: event.source.userId,
+      senderName: senderProfile ? senderProfile.displayName : 'Unknown User',
+      timestamp: event.timestamp,
+      replied: false,
+      messageId: event.message.id,
+      sourceType: event.source.type  // room, group, or user
+    };
+    
+    console.log(`メッセージを保存: ${event.message.text}`);
+    
+    // Slackに通知を送信
+    const sourceTypeText = {
+      'user': '個別チャット',
+      'group': 'グループ',
+      'room': 'ルーム'
+    }[event.source.type] || '不明';
+    
+    await sendSlackNotification(`*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${senderProfile.displayName}\n*内容*: ${event.message.text}\n*メッセージID*: ${event.message.id}`);
+    
+    // 返信対象メッセージIDを識別するパターン
+    const replyToPattern = /返信対象ID:(\w+)/;
+    const match = event.message.text.match(replyToPattern);
+    
+    if (match && match[1]) {
+      const messageId = match[1];
+      let found = false;
       
-      // Slackに通知
-      await sendSlackNotification(`*個別チャットからのメッセージ*\n*送信者*: ${userProfile.displayName}\n*内容*: ${event.message.text}`);
-      
-      // 返信対象メッセージIDを識別するパターン
-      const replyToPattern = /返信対象ID:(\w+)/;
-      const match = event.message.text.match(replyToPattern);
-      
-      if (match && match[1]) {
-        const messageId = match[1];
-        let found = false;
-        
-        // 自分のメッセージストアから該当IDを検索
-        const myUserId = event.source.userId;
-        if (messageStore[myUserId] && messageStore[myUserId][messageId]) {
-          messageStore[myUserId][messageId].replied = true;
+      // すべてのユーザーのメッセージストアから該当IDを検索
+      for (const userId in messageStore) {
+        const userMessages = messageStore[userId];
+        if (userMessages[messageId]) {
+          userMessages[messageId].replied = true;
           found = true;
           console.log(`メッセージID:${messageId}に対する返信を記録しました`);
           
           // Slackに返信完了通知
           await sendSlackNotification(`*返信完了*\n*メッセージID*: ${messageId}\n*返信内容*: ${event.message.text}`);
+          break;
         }
-        
-        // 返信確認メッセージ
-        return client.replyMessage(event.replyToken, {
-          type: 'text',
-          text: found 
-            ? `返信を記録しました。メッセージID:${messageId}` 
-            : `指定されたメッセージID:${messageId}が見つかりませんでした`
-        });
       }
       
-      // 自動返信を行わない（Slackで確認して手動で対応する）
-    } catch (error) {
-      console.error('メッセージ処理エラー:', error);
+      // 返信確認メッセージ
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: found 
+          ? `返信を記録しました。メッセージID:${messageId}` 
+          : `指定されたメッセージID:${messageId}が見つかりませんでした`
+      });
     }
+    
+  } catch (error) {
+    console.error('メッセージ処理エラー:', error);
   }
 
   return Promise.resolve(null);
@@ -213,11 +208,11 @@ cron.schedule('* * * * *', async () => {
   const oneMinuteInMs = 1 * 60 * 1000;
   
   let totalUnrepliedCount = 0;
+  let unrepliedMessagesAll = [];
   
   // 各ユーザーのメッセージをチェック
   for (const userId in messageStore) {
     const userMessages = messageStore[userId];
-    const unrepliedMessages = [];
     
     // 未返信で1分経過したメッセージを抽出
     for (const messageId in userMessages) {
@@ -228,26 +223,26 @@ cron.schedule('* * * * *', async () => {
       
       // 1分以上経過した未返信メッセージをチェック
       if (!message.replied && elapsedTime >= oneMinuteInMs) {
-        unrepliedMessages.push(message);
+        unrepliedMessagesAll.push(message);
         totalUnrepliedCount++;
       }
     }
-    
-    // Slackにリマインダーを送信
-    if (unrepliedMessages.length > 0) {
-      try {
-        const reminderText = unrepliedMessages.map(msg => 
-          `*送信者*: ${msg.senderName}\n*内容*: ${msg.text}\n*メッセージID*: ${msg.messageId}\n*経過時間*: ${Math.floor((now - msg.timestamp) / (60 * 1000))}分`
-        ).join('\n\n');
-        
-        console.log('Slackにリマインダーを送信します:', reminderText);
-        
-        await sendSlackNotification(`*【未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`);
-        
-        console.log(`${unrepliedMessages.length}件のリマインダーをSlackに送信しました`);
-      } catch (error) {
-        console.error('Slackリマインダー送信エラー:', error);
-      }
+  }
+  
+  // Slackにリマインダーを送信（すべてのメッセージをまとめて1つの通知にする）
+  if (unrepliedMessagesAll.length > 0) {
+    try {
+      const reminderText = unrepliedMessagesAll.map(msg => 
+        `*送信者*: ${msg.senderName}\n*送信元*: ${msg.sourceType || '不明'}\n*内容*: ${msg.text}\n*メッセージID*: ${msg.messageId}\n*経過時間*: ${Math.floor((now - msg.timestamp) / (60 * 1000))}分`
+      ).join('\n\n');
+      
+      console.log('Slackにリマインダーを送信します:', reminderText);
+      
+      await sendSlackNotification(`*【未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`);
+      
+      console.log(`${unrepliedMessagesAll.length}件のリマインダーをSlackに送信しました`);
+    } catch (error) {
+      console.error('Slackリマインダー送信エラー:', error);
     }
   }
   
