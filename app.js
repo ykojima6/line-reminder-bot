@@ -11,9 +11,6 @@ const config = {
   channelSecret: process.env.LINE_CHANNEL_SECRET
 };
 
-// ボット自身のユーザーID - 明示的に除外するために設定
-const BOT_USER_ID = 'Ubf54091c82026dcfb8ede187814fdb9b'; // ログから特定したボットID
-
 // 環境変数の検証
 if (!process.env.LINE_CHANNEL_ACCESS_TOKEN || !process.env.LINE_CHANNEL_SECRET) {
   console.error('エラー: LINE_CHANNEL_ACCESS_TOKEN または LINE_CHANNEL_SECRET が設定されていません');
@@ -31,15 +28,13 @@ console.log('環境変数の状態:');
 console.log('LINE_CHANNEL_ACCESS_TOKEN exists:', !!process.env.LINE_CHANNEL_ACCESS_TOKEN);
 console.log('LINE_CHANNEL_SECRET exists:', !!process.env.LINE_CHANNEL_SECRET);
 console.log('SLACK_WEBHOOK_URL exists:', !!process.env.SLACK_WEBHOOK_URL);
-console.log('BOT_USER_ID:', BOT_USER_ID);
 
 // LINEクライアントを初期化
 const client = new line.Client(config);
 
 // 会話状態管理
-// ユーザーごとに未返信メッセージを追跡
-// { userId: { messageText, timestamp, messageId, displayName, sourceType } }
-const pendingReplies = {};
+// { userId: { messageText, timestamp, messageId, displayName, sourceType, needsReply } }
+const messageLog = {};
 
 // デバッグ用ログ履歴
 const debugLogs = [];
@@ -90,62 +85,14 @@ async function sendSlackNotification(message) {
   }
 }
 
-// ユーザーへの返信をマークする関数
+// 返信済みとしてマークする関数
 function markAsReplied(userId) {
-  if (pendingReplies[userId]) {
+  if (messageLog[userId] && messageLog[userId].needsReply) {
     logDebug(`ユーザー ${userId} の会話を返信済みとしてマークします`);
-    
-    // 返信済みメッセージの情報を保存（デバッグ用）
-    const repliedMessage = pendingReplies[userId];
-    logDebug(`返信済みメッセージ: ${JSON.stringify(repliedMessage)}`);
-    
-    // ユーザーを未返信リストから削除
-    delete pendingReplies[userId];
+    messageLog[userId].needsReply = false;
     return true;
   }
   return false;
-}
-
-// メッセージを送信し、返信済みとしてマークする関数
-async function replyToUser(event, message) {
-  try {
-    // LINE APIを使ってメッセージを返信
-    const result = await client.replyMessage(event.replyToken, {
-      type: 'text',
-      text: message
-    });
-    
-    logDebug(`メッセージを返信しました: ${message}`);
-    
-    // 返信後、そのユーザーを未返信リストから削除
-    markAsReplied(event.source.userId);
-    
-    return true;
-  } catch (error) {
-    console.error('返信エラー:', error);
-    return false;
-  }
-}
-
-// ユーザーにプッシュメッセージを送信し、返信済みとしてマークする関数
-async function pushMessageToUser(userId, message) {
-  try {
-    // LINE APIを使ってメッセージを送信
-    await client.pushMessage(userId, {
-      type: 'text',
-      text: message
-    });
-    
-    logDebug(`プッシュメッセージを送信しました: ${userId} - ${message}`);
-    
-    // 送信後、そのユーザーを未返信リストから削除
-    markAsReplied(userId);
-    
-    return true;
-  } catch (error) {
-    console.error('メッセージ送信エラー:', error);
-    return false;
-  }
 }
 
 // LINE Bot用Webhookルート - カスタム署名検証
@@ -209,11 +156,11 @@ async function handleEvent(event) {
     const messageId = event.message.id;
     const timestamp = event.timestamp;
     
-    // ボットからのメッセージをスキップ
-    if (userId === BOT_USER_ID) {
-      logDebug(`ボット自身(${BOT_USER_ID})のメッセージなのでスキップします: ${messageText}`);
-      return Promise.resolve(null);
-    }
+    // replyTokenの有無でボットからの送信かを判断
+    // webhookイベントはユーザーからの送信を表し、replyTokenが付与される
+    const isFromUser = !!event.replyToken;
+    
+    logDebug(`メッセージ送信者判定: userId=${userId}, isFromUser=${isFromUser}, replyToken=${!!event.replyToken}`);
     
     // 送信者情報を取得
     let senderProfile;
@@ -234,58 +181,76 @@ async function handleEvent(event) {
     const sourceType = event.source.type;
 
     // 特別コマンド処理: すべて返信済みにする
-    if (messageText === '全部返信済み' || messageText === 'すべて返信済み') {
+    if (isFromUser && (messageText === '全部返信済み' || messageText === 'すべて返信済み')) {
       markAsReplied(userId);
       
       await sendSlackNotification(`*すべて返信済みにしました*\n*ユーザー*: ${userDisplayName}\nこのユーザーへの未返信状態をクリアしました。`);
       
-      // 返信を送信し、送信後に返信済みとマーク
-      return replyToUser(event, "未返信状態をクリアしました。");
+      // 返信を送信
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: "未返信状態をクリアしました。"
+      });
     }
     
     // 特別コマンド処理: ステータスチェック
-    if (messageText === 'ステータス' || messageText === 'status') {
-      const needsReply = userId in pendingReplies;
+    if (isFromUser && (messageText === 'ステータス' || messageText === 'status')) {
+      const needsReply = messageLog[userId] && messageLog[userId].needsReply;
       const statusMessage = needsReply 
         ? "現在、あなたへの返信が必要なメッセージがあります。"
         : "現在、あなたへの未返信メッセージはありません。";
       
       logDebug(`ステータスチェック: ユーザー ${userId} の返信状態: ${needsReply ? '未返信あり' : '未返信なし'}`);
       
-      // 返信を送信し、送信後に返信済みとマーク
-      return replyToUser(event, statusMessage);
+      // 返信を送信
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: statusMessage
+      });
     }
     
     // 特別コマンド処理: デバッグログ
-    if (messageText === 'デバッグログ' || messageText === 'debuglog') {
-      const pendingCount = Object.keys(pendingReplies).length;
+    if (isFromUser && (messageText === 'デバッグログ' || messageText === 'debuglog')) {
+      // 未返信メッセージの数を数える
+      let pendingCount = 0;
+      for (const uid in messageLog) {
+        if (messageLog[uid].needsReply) {
+          pendingCount++;
+        }
+      }
+      
       const logMessage = `*デバッグ情報*\n未返信ユーザー数: ${pendingCount}\n\n最新のログ（最大10件）:\n${debugLogs.slice(0, 10).join('\n')}`;
       
-      // 返信を送信し、送信後に返信済みとマーク
-      return replyToUser(event, logMessage);
+      // 返信を送信
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: logMessage
+      });
     }
     
-    // ユーザーからのメッセージを記録
-    pendingReplies[userId] = {
+    // メッセージを記録
+    messageLog[userId] = {
       messageText: messageText,
       timestamp: timestamp,
       messageId: messageId,
       displayName: userDisplayName,
-      sourceType: sourceType
+      sourceType: sourceType,
+      needsReply: isFromUser // ユーザーからのメッセージのみ返信が必要
     };
     
-    logDebug(`ユーザー${userId}からのメッセージを未返信として記録しました: ${messageText}`);
-    logDebug(`現在の未返信ユーザー数: ${Object.keys(pendingReplies).length}`);
+    logDebug(`ユーザー${userId}のメッセージを記録しました: ${messageText}, 返信必要=${isFromUser}`);
     
-    // Slackに通知を送信
-    const sourceTypeText = {
-      'user': '個別チャット',
-      'group': 'グループ',
-      'room': 'ルーム'
-    }[sourceType] || '不明';
-    
-    // ユーザーからのメッセージを通知
-    await sendSlackNotification(`*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*メッセージID*: ${messageId}`);
+    // ユーザーからのメッセージのみSlackに通知
+    if (isFromUser) {
+      const sourceTypeText = {
+        'user': '個別チャット',
+        'group': 'グループ',
+        'room': 'ルーム'
+      }[sourceType] || '不明';
+      
+      // Slackに通知を送信
+      await sendSlackNotification(`*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*メッセージID*: ${messageId}`);
+    }
     
   } catch (error) {
     console.error('メッセージ処理エラー:', error);
@@ -312,27 +277,6 @@ app.post('/api/mark-as-replied', express.json(), (req, res) => {
   }
 });
 
-// 外部から返信を送信するエンドポイント
-app.post('/api/send-reply', express.json(), async (req, res) => {
-  const { userId, message } = req.body;
-  
-  if (!userId || !message) {
-    return res.status(400).json({ success: false, error: 'ユーザーIDとメッセージが必要です' });
-  }
-  
-  try {
-    const success = await pushMessageToUser(userId, message);
-    
-    if (success) {
-      res.status(200).json({ success: true, message: `ユーザー ${userId} にメッセージを送信しました` });
-    } else {
-      res.status(500).json({ success: false, message: `ユーザー ${userId} へのメッセージ送信に失敗しました` });
-    }
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
 // 1分ごとに未返信メッセージをチェックするスケジューラー
 let isCheckingUnreplied = false; // 実行中フラグ
 
@@ -352,30 +296,27 @@ cron.schedule('* * * * *', async () => {
     
     let unrepliedUsers = [];
     
-    // すべての未返信メッセージをチェック
-    for (const userId in pendingReplies) {
-      // ボットユーザーIDをスキップ
-      if (userId === BOT_USER_ID) {
-        logDebug(`ボット自身(${BOT_USER_ID})のメッセージなのでリマインダーをスキップします`);
-        delete pendingReplies[userId]; // ボットのメッセージを削除
-        continue;
-      }
+    // すべてのメッセージをチェック
+    for (const userId in messageLog) {
+      const userInfo = messageLog[userId];
       
-      const userInfo = pendingReplies[userId];
-      const elapsedTime = now - userInfo.timestamp;
-      const elapsedMinutes = Math.floor(elapsedTime / (60 * 1000));
-      
-      if (elapsedTime >= oneMinuteInMs) {
-        unrepliedUsers.push({
-          userId,
-          name: userInfo.displayName,
-          message: {
-            text: userInfo.messageText,
-            id: userInfo.messageId
-          },
-          elapsedMinutes,
-          sourceType: userInfo.sourceType
-        });
+      // 返信が必要なメッセージのみ処理
+      if (userInfo.needsReply) {
+        const elapsedTime = now - userInfo.timestamp;
+        const elapsedMinutes = Math.floor(elapsedTime / (60 * 1000));
+        
+        if (elapsedTime >= oneMinuteInMs) {
+          unrepliedUsers.push({
+            userId,
+            name: userInfo.displayName,
+            message: {
+              text: userInfo.messageText,
+              id: userInfo.messageId
+            },
+            elapsedMinutes,
+            sourceType: userInfo.sourceType
+          });
+        }
       }
     }
     
@@ -408,13 +349,21 @@ cron.schedule('* * * * *', async () => {
   }
 });
 
-// 現在の未返信メッセージ状態を表示するエンドポイント
-app.get('/api/pending-replies', (req, res) => {
-  const count = Object.keys(pendingReplies).length;
+// 現在のメッセージ状態を表示するエンドポイント
+app.get('/api/messages', (req, res) => {
+  // 未返信メッセージの数を数える
+  let pendingCount = 0;
+  for (const uid in messageLog) {
+    if (messageLog[uid].needsReply) {
+      pendingCount++;
+    }
+  }
+  
   res.json({
     success: true,
-    count,
-    pendingReplies
+    totalCount: Object.keys(messageLog).length,
+    pendingCount,
+    messages: messageLog
   });
 });
 
