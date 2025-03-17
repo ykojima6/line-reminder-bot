@@ -23,8 +23,9 @@ console.log('SLACK_WEBHOOK_URL exists:', !!process.env.SLACK_WEBHOOK_URL);
 // LINEクライアントを初期化
 const client = new line.Client(config);
 
-// メッセージを保存するためのオブジェクト
-const messageStore = {};
+// 会話履歴を保存する構造
+// { userId: { lastMessage: { id, text, timestamp }, pendingResponse: true/false } }
+const conversations = {};
 
 // 生のリクエストボディを取得するためのミドルウェア
 app.use('/webhook', express.raw({ type: 'application/json' }));
@@ -129,123 +130,124 @@ async function handleEvent(event) {
       }
     } catch (error) {
       console.log('プロフィール取得エラー:', error.message);
-      // プロフィールが取得できない場合はデフォルト値を設定
       senderProfile = { displayName: 'Unknown User' };
     }
 
-    // メッセージを送信したユーザーID（自分自身のユーザーID）
-    const myUserId = event.source.userId;
+    const userId = event.source.userId;
+    const userDisplayName = senderProfile ? senderProfile.displayName : 'Unknown User';
+    const sourceType = event.source.type;
+    const messageId = event.message.id;
+    const messageText = event.message.text;
+    const timestamp = event.timestamp;
     
-    // 既存の方法は残しておく（オプション）
-    const replyToPattern = /返信対象ID:(\w+)/;
-    const match = event.message.text.match(replyToPattern);
-    
-    if (match && match[1]) {
-      // 既存のIDベースの返信マーク処理
-      // ...（既存コード）
-    } else if (event.message.text === '全部返信済み' || event.message.text === 'すべて返信済み') {
-      // 全返信済みコマンド
-      // ...（既存コード）
-    } else {
-      // 新機能: 最新の未返信メッセージに対して自動的に返信済みとマーク
-      let markedMessageId = null;
-      let markedMessage = null;
-      
-      // まずは自分宛てのメッセージから最新の未返信メッセージを探す
-      if (messageStore[myUserId]) {
-        let latestTimestamp = 0;
-        
-        for (const messageId in messageStore[myUserId]) {
-          const message = messageStore[myUserId][messageId];
-          if (!message.replied && message.timestamp > latestTimestamp) {
-            latestTimestamp = message.timestamp;
-            markedMessageId = messageId;
-            markedMessage = message;
-          }
-        }
-        
-        // 最新の未返信メッセージが見つかった場合、返信済みとマーク
-        if (markedMessageId) {
-          messageStore[myUserId][markedMessageId].replied = true;
-          console.log(`最新の未返信メッセージ(ID:${markedMessageId})を返信済みとしてマークしました`);
-          
-          // Slackに返信完了通知
-          await sendSlackNotification(`*返信完了*\n*メッセージID*: ${markedMessageId}\n*元のメッセージ*: ${markedMessage.text}\n*返信内容*: ${event.message.text}`);
-        }
-      }
-      
-      // 新規メッセージとして保存
-      if (!messageStore[myUserId]) {
-        messageStore[myUserId] = {};
-      }
-      
-      messageStore[myUserId][event.message.id] = {
-        text: event.message.text,
-        sender: event.source.userId,
-        senderName: senderProfile ? senderProfile.displayName : 'Unknown User',
-        timestamp: event.timestamp,
-        replied: false,
-        messageId: event.message.id,
-        sourceType: event.source.type
+    // 会話状態を取得または初期化
+    if (!conversations[userId]) {
+      conversations[userId] = {
+        lastMessage: null,
+        pendingResponse: false
       };
-      
-      console.log(`メッセージを保存: ${event.message.text}`);
-      
-      // Slackに通知を送信
-      const sourceTypeText = {
-        'user': '個別チャット',
-        'group': 'グループ',
-        'room': 'ルーム'
-      }[event.source.type] || '不明';
-      
-      await sendSlackNotification(`*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${senderProfile.displayName}\n*内容*: ${event.message.text}\n*メッセージID*: ${event.message.id}`);
     }
     
+    // 特別コマンド処理：すべて返信済みにする
+    if (messageText === '全部返信済み' || messageText === 'すべて返信済み') {
+      conversations[userId].pendingResponse = false;
+      
+      await sendSlackNotification(`*すべて返信済みにしました*\n*ユーザー*: ${userDisplayName}\nこのユーザーの未返信状態をクリアしました。`);
+      
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: `未返信状態をクリアしました。`
+      });
+    }
+    
+    // 相互会話パターンによる応答状態のチェック
+    const convo = conversations[userId];
+    
+    // 前回のメッセージに対してレスポンスがまだ来ていない場合、それを返信済みとする
+    if (convo.pendingResponse) {
+      convo.pendingResponse = false;
+      
+      // 前回のメッセージに対する返信としてマーク
+      const prevMessage = convo.lastMessage;
+      if (prevMessage) {
+        await sendSlackNotification(`*返信完了*\n*ユーザー*: ${userDisplayName}\n*元のメッセージ*: ${prevMessage.text}\n*返信内容*: ${messageText}`);
+        console.log(`ユーザー${userId}の前回のメッセージに対する返信を記録しました`);
+      }
+    }
+    
+    // ユーザーからの新しいメッセージとして記録
+    convo.lastMessage = {
+      id: messageId,
+      text: messageText,
+      timestamp: timestamp
+    };
+    convo.pendingResponse = true;
+    
+    // Slackに通知を送信
+    const sourceTypeText = {
+      'user': '個別チャット',
+      'group': 'グループ',
+      'room': 'ルーム'
+    }[sourceType] || '不明';
+    
+    await sendSlackNotification(`*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*メッセージID*: ${messageId}`);
+    
+    console.log(`ユーザー${userId}からの新規メッセージを記録しました: ${messageText}`);
   } catch (error) {
     console.error('メッセージ処理エラー:', error);
   }
 
   return Promise.resolve(null);
 }
-// 1分ごとに未返信メッセージをチェックするスケジューラー
-// cron式: '* * * * *' は1分ごとに実行
-cron.schedule('* * * * *', async () => {
-  console.log('1分間隔の未返信チェック実行中...', new Date().toISOString());
+
+// 1時間ごとに未返信メッセージをチェックするスケジューラー
+// cron式: '0 * * * *' は1時間ごとに実行（0分ごとに実行）
+cron.schedule('0 * * * *', async () => {
+  console.log('1時間間隔の未返信チェック実行中...', new Date().toISOString());
   const now = Date.now();
-  const oneMinuteInMs = 1 * 60 * 1000;
+  const sixHoursInMs = 6 * 60 * 60 * 1000;  // 6時間をミリ秒に変換
   
-  let totalUnrepliedCount = 0;
   let unrepliedMessagesAll = [];
   
-  // 各ユーザーのメッセージをチェック
-  for (const userId in messageStore) {
-    const userMessages = messageStore[userId];
+  // すべてのユーザーの会話をチェック
+  for (const userId in conversations) {
+    const convo = conversations[userId];
     
-    // 未返信で1分経過したメッセージを抽出
-    for (const messageId in userMessages) {
-      const message = userMessages[messageId];
-      const elapsedTime = now - message.timestamp;
+    // 応答待ちのメッセージがあり、6時間以上経過していれば未返信としてマーク
+    if (convo.pendingResponse && convo.lastMessage) {
+      const elapsedTime = now - convo.lastMessage.timestamp;
+      const elapsedHours = Math.floor(elapsedTime / (60 * 60 * 1000));
       
-      console.log(`メッセージID: ${messageId}, 返信済み: ${message.replied}, 経過時間: ${Math.floor(elapsedTime / (60 * 1000))}分`);
-      
-      // 1分以上経過した未返信メッセージをチェック
-      if (!message.replied && elapsedTime >= oneMinuteInMs) {
-        unrepliedMessagesAll.push(message);
-        totalUnrepliedCount++;
+      if (elapsedTime >= sixHoursInMs) {
+        // ユーザープロフィールを取得（利用可能であれば）
+        let userName = 'Unknown User';
+        try {
+          const profile = await client.getProfile(userId);
+          userName = profile.displayName;
+        } catch (error) {
+          console.log(`ユーザー${userId}のプロフィール取得エラー:`, error.message);
+        }
+        
+        unrepliedMessagesAll.push({
+          userId: userId,
+          userName: userName,
+          message: convo.lastMessage,
+          elapsedHours: elapsedHours
+        });
       }
     }
   }
   
-  // Slackにリマインダーを送信（すべてのメッセージをまとめて1つの通知にする）
+  // Slackにリマインダーを送信
   if (unrepliedMessagesAll.length > 0) {
     try {
-      const reminderText = unrepliedMessagesAll.map(msg => 
-        `*送信者*: ${msg.senderName}\n*送信元*: ${msg.sourceType || '不明'}\n*内容*: ${msg.text}\n*メッセージID*: ${msg.messageId}\n*経過時間*: ${Math.floor((now - msg.timestamp) / (60 * 1000))}分`
+      const reminderText = unrepliedMessagesAll.map(item => 
+        `*送信者*: ${item.userName}\n*ユーザーID*: ${item.userId}\n*内容*: ${item.message.text}\n*メッセージID*: ${item.message.id}\n*経過時間*: ${item.elapsedHours}時間`
       ).join('\n\n');
       
       console.log('Slackにリマインダーを送信します:', reminderText);
       
-      await sendSlackNotification(`*【未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`);
+      await sendSlackNotification(`*【6時間以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`);
       
       console.log(`${unrepliedMessagesAll.length}件のリマインダーをSlackに送信しました`);
     } catch (error) {
@@ -253,29 +255,7 @@ cron.schedule('* * * * *', async () => {
     }
   }
   
-  console.log(`1分チェック完了: 合計${totalUnrepliedCount}件の未返信メッセージを検出`);
-});
-
-// 古いメッセージを定期的にクリーンアップする処理
-cron.schedule('0 0 * * *', () => {
-  console.log('古いメッセージのクリーンアップ実行中...');
-  const now = Date.now();
-  const threeDaysInMs = 3 * 24 * 60 * 60 * 1000;
-  
-  let cleanedCount = 0;
-  for (const userId in messageStore) {
-    const userMessages = messageStore[userId];
-    
-    for (const messageId in userMessages) {
-      const message = userMessages[messageId];
-      if ((now - message.timestamp) >= threeDaysInMs) {
-        delete userMessages[messageId];
-        cleanedCount++;
-      }
-    }
-  }
-  
-  console.log(`クリーンアップ完了: ${cleanedCount}件のメッセージを削除しました`);
+  console.log(`未返信チェック完了: 合計${unrepliedMessagesAll.length}件の未返信メッセージを検出`);
 });
 
 // サーバー起動
