@@ -154,7 +154,7 @@ async function handleEvent(event) {
       
       return client.replyMessage(event.replyToken, {
         type: 'text',
-        text: 未返信状態をクリアしました。
+        text: "未返信状態をクリアしました。"
       });
     }
     
