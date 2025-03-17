@@ -205,7 +205,7 @@ async function handleEvent(event) {
 cron.schedule('0 * * * *', async () => {
   console.log('1時間間隔の未返信チェック実行中...', new Date().toISOString());
   const now = Date.now();
-  const sixHoursInMs = 6 * 60 * 60 * 1000;  // 6時間をミリ秒に変換
+  const sixHoursInMs = 1 * 60 * 1000;  // 6時間をミリ秒に変換
   
   let unrepliedMessagesAll = [];
   
