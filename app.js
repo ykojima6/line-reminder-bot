@@ -36,6 +36,9 @@ const client = new line.Client(config);
 // { userId: { lastMessageFromUser: boolean, lastTimestamp, lastMessage, replyRequired: boolean } }
 const conversations = {};
 
+// ボットからの送信を記録する（メッセージID -> 送信時間のマッピング）
+const botSentMessages = new Map();
+
 // 生のリクエストボディを取得するためのミドルウェア
 app.use('/webhook', express.raw({ type: 'application/json' }));
 
@@ -69,6 +72,38 @@ async function sendSlackNotification(message) {
     if (error.response) {
       console.error('レスポンス:', error.response.status, error.response.data);
     }
+  }
+}
+
+// ユーザーIDに関連する会話を返信済みとしてマークする関数
+function markConversationAsReplied(userId) {
+  if (conversations[userId]) {
+    console.log(`ユーザー ${userId} の会話を返信済みとしてマークします`);
+    conversations[userId].replyRequired = false;
+    return true;
+  }
+  return false;
+}
+
+// ユーザーにメッセージを送信し、会話を返信済みとしてマークする関数
+async function sendMessageAndMarkAsReplied(userId, message) {
+  try {
+    // メッセージを送信
+    const result = await client.pushMessage(userId, {
+      type: 'text',
+      text: message
+    });
+    
+    // 送信したメッセージを記録
+    botSentMessages.set(result.messageId, Date.now());
+    
+    // 返信済みとしてマーク
+    markConversationAsReplied(userId);
+    
+    return result;
+  } catch (error) {
+    console.error('メッセージ送信エラー:', error);
+    throw error;
   }
 }
 
@@ -118,17 +153,9 @@ app.post('/webhook', (req, res) => {
     });
 });
 
-// メッセージがボットからのものかどうかを判定する関数
-// source.type が 'user' で、イベントタイプがwebhookイベントである場合、
-// このメッセージはボットからのものではなくユーザーからのものと判断する
-function isUserMessage(event) {
-  // webhookイベントはLINEユーザーからのメッセージを示す
-  return event.source && event.source.type === 'user';
-}
-
 // イベントハンドラー
 async function handleEvent(event) {
-  console.log('イベント処理:', event.type);
+  console.log('イベント処理:', event.type, JSON.stringify(event));
   
   // メッセージイベントのみ処理
   if (event.type !== 'message' || event.message.type !== 'text') {
@@ -158,28 +185,44 @@ async function handleEvent(event) {
     const messageText = event.message.text;
     const timestamp = event.timestamp;
     
-    // メッセージの送信者を判定（APIからの情報を使用）
-    const isFromUser = isUserMessage(event);
-    
     // 特別コマンド処理: すべて返信済みにする
     if (messageText === '全部返信済み' || messageText === 'すべて返信済み') {
-      if (conversations[userId]) {
-        // 最後のメッセージがボットからのものとしてマーク
-        conversations[userId].lastMessageFromUser = false;
-        conversations[userId].replyRequired = false;
-      }
+      markConversationAsReplied(userId);
       
       await sendSlackNotification(`*すべて返信済みにしました*\n*ユーザー*: ${userDisplayName}\nこのユーザーへの未返信状態をクリアしました。`);
       
       return client.replyMessage(event.replyToken, {
         type: 'text',
         text: "未返信状態をクリアしました。"
+      }).then(result => {
+        // ボットが送信したメッセージを記録
+        botSentMessages.set(result.messageId, Date.now());
       });
     }
+
+    // このメッセージがボットから送信されたものかを確認
+    const isFromBot = botSentMessages.has(messageId);
     
+    // 古いエントリを削除（5分以上前のメッセージ）
+    const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+    botSentMessages.forEach((time, id) => {
+      if (time < fiveMinutesAgo) {
+        botSentMessages.delete(id);
+      }
+    });
+    
+    console.log(`メッセージID ${messageId} はボットからのメッセージ: ${isFromBot}`);
+    
+    // ボットからのメッセージなら処理をスキップ
+    if (isFromBot) {
+      console.log('ボットからのメッセージなのでスキップします');
+      return Promise.resolve(null);
+    }
+    
+    // ユーザーからのメッセージとして処理
     // 会話状態を更新
     conversations[userId] = {
-      lastMessageFromUser: isFromUser,
+      lastMessageFromUser: true,  // ユーザーからのメッセージ
       lastTimestamp: timestamp,
       lastMessage: {
         text: messageText,
@@ -187,8 +230,8 @@ async function handleEvent(event) {
       },
       displayName: userDisplayName,
       sourceType: sourceType,
-      // ユーザーからのメッセージの場合、返信が必要とマーク
-      replyRequired: isFromUser
+      // ユーザーからのメッセージなので返信が必要とマーク
+      replyRequired: true
     };
     
     console.log(`ユーザー${userId}の会話状態:`, JSON.stringify(conversations[userId]));
@@ -200,16 +243,8 @@ async function handleEvent(event) {
       'room': 'ルーム'
     }[sourceType] || '不明';
     
-    // ユーザーからのメッセージの場合のみ通知
-    if (isFromUser) {
-      await sendSlackNotification(`*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*メッセージID*: ${messageId}`);
-    } else {
-      // ボットからの返信の場合、そのユーザーの返信フラグをクリア
-      if (conversations[userId]) {
-        conversations[userId].replyRequired = false;
-        console.log(`ボットからの返信を記録しました: ${messageText}`);
-      }
-    }
+    // ユーザーからのメッセージを通知
+    await sendSlackNotification(`*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*メッセージID*: ${messageId}`);
     
   } catch (error) {
     console.error('メッセージ処理エラー:', error);
@@ -217,6 +252,19 @@ async function handleEvent(event) {
 
   return Promise.resolve(null);
 }
+
+// LINEメッセージ送信完了イベントを処理するエンドポイント（カスタム）
+app.post('/message-sent', (req, res) => {
+  const { userId, messageId } = req.body;
+  
+  // 送信完了としてマーク
+  botSentMessages.set(messageId, Date.now());
+  markConversationAsReplied(userId);
+  
+  console.log(`メッセージ送信完了: User=${userId}, MessageID=${messageId}`);
+  
+  res.status(200).json({ success: true });
+});
 
 // 1分ごとに未返信メッセージをチェックするスケジューラー
 let isCheckingUnreplied = false; // 実行中フラグ
@@ -241,8 +289,8 @@ cron.schedule('* * * * *', async () => {
     for (const userId in conversations) {
       const convo = conversations[userId];
       
-      // 最後のメッセージがユーザーからのもので、返信が必要でまだされていない場合
-      if (convo.lastMessageFromUser && convo.replyRequired) {
+      // 返信が必要でまだされていない場合
+      if (convo.replyRequired === true) {
         const elapsedTime = now - convo.lastTimestamp;
         const elapsedMinutes = Math.floor(elapsedTime / (60 * 1000));
         
