@@ -150,7 +150,7 @@ async function handleEvent(event) {
         conversations[userId].lastMessageFromUser = false;
       }
       
-      await sendSlackNotification(*すべて返信済みにしました*\n*ユーザー*: ${userDisplayName}\nこのユーザーへの未返信状態をクリアしました。);
+      await sendSlackNotification('*すべて返信済みにしました*\n*ユーザー*: ${userDisplayName}\nこのユーザーへの未返信状態をクリアしました。');
       
       return client.replyMessage(event.replyToken, {
         type: 'text',
@@ -199,7 +199,7 @@ async function handleEvent(event) {
     
     // ユーザーからのメッセージの場合のみ通知
     if (isFromUser) {
-      await sendSlackNotification(*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*メッセージID*: ${messageId});
+      await sendSlackNotification('*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*メッセージID*: ${messageId}');
     }
     
     // ボットからの返信の場合
@@ -259,7 +259,7 @@ cron.schedule('* * * * *', async () => {
         return *送信者*: ${user.name}\n*送信元*: ${sourceTypeText}\n*内容*: ${user.message.text}\n*メッセージID*: ${user.message.id}\n*経過時間*: ${user.elapsedMinutes}分;
       }).join('\n\n');
       
-      await sendSlackNotification(*【1分以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText});
+      await sendSlackNotification('*【1分以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}');
       
       console.log(${unrepliedUsers.length}件のリマインダーをSlackに送信しました);
     } catch (error) {
