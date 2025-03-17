@@ -9,6 +9,12 @@ const config = {
   channelSecret: process.env.LINE_CHANNEL_SECRET || '6b51d27e178d6daf1948fdaad22cde04'
 };
 
+// LINEクライアントを初期化（これが欠けていました）
+const client = new line.Client(config);
+
+// メッセージを保存するためのオブジェクト（これが欠けていました）
+const messageStore = {};
+
 // JSONボディパーサー
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -70,7 +76,8 @@ async function handleEvent(event) {
           sender: userId,
           senderName: senderProfile.displayName,
           timestamp: event.timestamp,
-          replied: false
+          replied: false,
+          messageId: event.message.id  // messageIdを正確に保存
         };
         
         // メッセージを受信したことを通知
