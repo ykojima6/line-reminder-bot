@@ -1,6 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const line = require('@line/bot-sdk');
+const cron = require('node-cron');
 const app = express();
 
 // LINE API設定
@@ -16,6 +17,9 @@ console.log('LINE_CHANNEL_SECRET exists:', !!process.env.LINE_CHANNEL_SECRET);
 
 // LINEクライアントを初期化
 const client = new line.Client(config);
+
+// メッセージを保存するためのオブジェクト
+const messageStore = {};
 
 // 生のリクエストボディを取得するためのミドルウェア
 app.use('/webhook', express.raw({ type: 'application/json' }));
@@ -85,24 +89,161 @@ app.post('/webhook', (req, res) => {
     });
 });
 
-// イベントハンドラー（まずは最小限の実装）
+// イベントハンドラー
 async function handleEvent(event) {
   console.log('イベント処理:', event.type);
   
-  // テキストメッセージイベントのみに返信
-  if (event.type === 'message' && event.message.type === 'text') {
-    const echo = { type: 'text', text: `メッセージを受信しました: ${event.message.text}` };
-    
+  // メッセージイベントのみ処理
+  if (event.type !== 'message' || event.message.type !== 'text') {
+    return Promise.resolve(null);
+  }
+
+  // グループまたはルームからのメッセージの場合（公式アカウントからの可能性）
+  if (event.source.type === 'room' || event.source.type === 'group') {
     try {
-      await client.replyMessage(event.replyToken, echo);
-      console.log('返信送信成功');
+      // 送信者情報を取得（グループの場合）
+      let senderProfile;
+      if (event.source.type === 'room') {
+        senderProfile = await client.getRoomMemberProfile(event.source.roomId, event.source.userId);
+      } else if (event.source.type === 'group') {
+        senderProfile = await client.getGroupMemberProfile(event.source.groupId, event.source.userId);
+      }
+      
+      // 公式アカウントかどうかの判定（実際にはAPIで公式アカウントかを判断する必要があります）
+      // ここでは例として、表示名に【公式】が含まれているかどうかで判断します
+      const isOfficialAccount = senderProfile && senderProfile.displayName.includes('【公式】');
+      
+      if (isOfficialAccount) {
+        // メッセージを送信したユーザーID（自分自身のユーザーID）
+        const myUserId = event.source.userId;
+        
+        // メッセージを保存
+        if (!messageStore[myUserId]) {
+          messageStore[myUserId] = {};
+        }
+        
+        messageStore[myUserId][event.message.id] = {
+          text: event.message.text,
+          sender: event.source.userId,
+          senderName: senderProfile.displayName,
+          timestamp: event.timestamp,
+          replied: false,
+          messageId: event.message.id
+        };
+        
+        console.log(`公式アカウントからのメッセージを保存: ${event.message.text}`);
+        
+        // 確認用の返信（オプション）
+        return client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: `${senderProfile.displayName}からのメッセージを記録しました。12時間以内に返信がなければリマインドします。`
+        });
+      }
     } catch (error) {
-      console.error('返信送信エラー:', error);
+      console.error('メッセージ処理エラー:', error);
     }
   }
   
+  // ユーザーからの返信を処理
+  if (event.source.type === 'user') {
+    // 返信対象メッセージIDを識別するパターン
+    // 例: "返信対象ID:12345678" というフォーマットのメッセージを探す
+    const replyToPattern = /返信対象ID:(\w+)/;
+    const match = event.message.text.match(replyToPattern);
+    
+    if (match && match[1]) {
+      const messageId = match[1];
+      let found = false;
+      
+      // 自分のメッセージストアから該当IDを検索
+      const myUserId = event.source.userId;
+      if (messageStore[myUserId] && messageStore[myUserId][messageId]) {
+        messageStore[myUserId][messageId].replied = true;
+        found = true;
+        console.log(`メッセージID:${messageId}に対する返信を記録しました`);
+      }
+      
+      // 返信確認メッセージ
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: found 
+          ? `返信を記録しました。メッセージID:${messageId}` 
+          : `指定されたメッセージID:${messageId}が見つかりませんでした`
+      });
+    }
+    
+    // 通常のメッセージへの応答
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: `メッセージを受信しました: ${event.message.text}`
+    });
+  }
+
   return Promise.resolve(null);
 }
+
+// 12時間ごとに未返信メッセージをチェックするスケジューラー
+// cron式: '0 */12 * * *' は12時間ごとに実行 (0分、0時と12時、毎日、毎月、曜日指定なし)
+cron.schedule('0 */12 * * *', async () => {
+  console.log('未返信チェック実行中...');
+  const now = Date.now();
+  const twelveHoursInMs = 12 * 60 * 60 * 1000;
+  
+  // 各ユーザーのメッセージをチェック
+  for (const userId in messageStore) {
+    const userMessages = messageStore[userId];
+    const unrepliedMessages = [];
+    
+    // 未返信で12時間経過したメッセージを抽出
+    for (const messageId in userMessages) {
+      const message = userMessages[messageId];
+      if (!message.replied && (now - message.timestamp) >= twelveHoursInMs) {
+        unrepliedMessages.push(message);
+      }
+    }
+    
+    // リマインダーを送信
+    if (unrepliedMessages.length > 0) {
+      try {
+        const reminderText = unrepliedMessages.map(msg => 
+          `${msg.senderName}からのメッセージ: ${msg.text.substring(0, 30)}... (返信対象ID:${msg.messageId})`
+        ).join('\n\n');
+        
+        await client.pushMessage(userId, {
+          type: 'text',
+          text: `【リマインダー】\n以下のメッセージに12時間以上返信がありません:\n\n${reminderText}`
+        });
+        
+        console.log(`ユーザー${userId}に${unrepliedMessages.length}件のリマインダーを送信しました`);
+      } catch (error) {
+        console.error('リマインダー送信エラー:', error);
+      }
+    }
+  }
+});
+
+// 古いメッセージを定期的にクリーンアップする処理（オプション）
+// cron式: '0 0 * * *' は毎日0時に実行
+cron.schedule('0 0 * * *', () => {
+  console.log('古いメッセージのクリーンアップ実行中...');
+  const now = Date.now();
+  const threeDaysInMs = 3 * 24 * 60 * 60 * 1000;
+  
+  let cleanedCount = 0;
+  for (const userId in messageStore) {
+    const userMessages = messageStore[userId];
+    
+    for (const messageId in userMessages) {
+      const message = userMessages[messageId];
+      if ((now - message.timestamp) >= threeDaysInMs) {
+        delete userMessages[messageId];
+        cleanedCount++;
+      }
+    }
+  }
+  
+  console.log(`クリーンアップ完了: ${cleanedCount}件のメッセージを削除しました`);
+});
 
 // サーバー起動
 const PORT = process.env.PORT || 3000;
