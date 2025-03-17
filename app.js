@@ -256,7 +256,7 @@ cron.schedule('* * * * *', async () => {
           'room': 'ルーム'
         }[user.sourceType] || '不明';
         
-        return *送信者*: ${user.name}\n*送信元*: ${sourceTypeText}\n*内容*: ${user.message.text}\n*メッセージID*: ${user.message.id}\n*経過時間*: ${user.elapsedMinutes}分;
+        return `*送信者*: ${user.name}\n*送信元*: ${sourceTypeText}\n*内容*: ${user.message.text}\n*メッセージID*: ${user.message.id}\n*経過時間*: ${user.elapsedMinutes}分`;
       }).join('\n\n');
       
       await sendSlackNotification('*【1分以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}');
