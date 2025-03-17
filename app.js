@@ -26,7 +26,10 @@ const config = {
 };
 
 const client = new line.Client(config);
-
+// ルートパスへのハンドラーを追加
+app.get('/', (req, res) => {
+  res.send('LINE Bot Server is running!');
+});
 // Webhookルート
 app.post('/webhook', line.middleware(config), (req, res) => {
   Promise
