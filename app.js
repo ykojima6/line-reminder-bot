@@ -15,20 +15,29 @@ const config = {
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
 
 // 指定された返信済みとみなすユーザーID
-const REPLY_USER_ID = process.env.REPLY_USER_ID;
+const REPLY_USER_ID = process.env.REPLY_USER_ID || 'Ubf54091c82026dcfb8ede187814fdb9b';
 
 // ログ出力
 console.log('環境変数の状態:');
 console.log('LINE_CHANNEL_ACCESS_TOKEN exists:', !!process.env.LINE_CHANNEL_ACCESS_TOKEN);
 console.log('LINE_CHANNEL_SECRET exists:', !!process.env.LINE_CHANNEL_SECRET);
 console.log('SLACK_WEBHOOK_URL exists:', !!process.env.SLACK_WEBHOOK_URL);
-console.log('REPLY_USER_ID:', REPLY_USER_ID);
+console.log('REPLY_USER_ID:', safeUserId(REPLY_USER_ID));
 
 // LINEクライアントを初期化
 const client = new line.Client(config);
 
 // メッセージ履歴 - シンプルな配列として保存
 const messageHistory = [];
+
+// ログやデバッグ出力でユーザーIDを安全に表示する関数
+function safeUserId(userId) {
+  if (!userId) return 'unknown';
+  // ユーザーIDの先頭と末尾だけを表示し、中間は*で置き換える
+  const length = userId.length;
+  if (length <= 6) return '***'; // 短すぎる場合は全て隠す
+  return userId.substring(0, 3) + '***' + userId.substring(length - 3);
+}
 
 // 生のリクエストボディを取得するためのミドルウェア
 app.use('/webhook', express.raw({ type: 'application/json' }));
@@ -49,10 +58,17 @@ app.get('/webhook', (req, res) => {
 
 // デバッグ用ルート
 app.get('/debug', (req, res) => {
+  // 安全なバージョンのメッセージ履歴を作成（ユーザーIDを隠す）
+  const safeHistory = messageHistory.map(msg => ({
+    ...msg,
+    userId: safeUserId(msg.userId),
+    chatId: safeUserId(msg.chatId)
+  }));
+  
   const debugInfo = {
     messageCount: messageHistory.length,
     unrepliedCount: messageHistory.filter(msg => !msg.replied && msg.userId !== REPLY_USER_ID).length,
-    recentMessages: messageHistory.slice(-5) // 最新5件のメッセージ
+    recentMessages: safeHistory.slice(-5) // 最新5件のメッセージ
   };
   res.json(debugInfo);
 });
@@ -66,13 +82,32 @@ async function sendSlackNotification(message) {
 
   try {
     console.log('Slack通知を送信します:', message.substring(0, 100) + (message.length > 100 ? '...' : ''));
-    const response = await axios.post(SLACK_WEBHOOK_URL, { text: message });
-    console.log('Slack通知を送信しました, ステータス:', response.status);
-    return true;
+    
+    // axiosのタイムアウトを設定
+    const response = await axios.post(SLACK_WEBHOOK_URL, { text: message }, {
+      timeout: 10000, // 10秒のタイムアウト
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    console.log('Slack通知レスポンス:', response.status, response.statusText);
+    
+    if (response.status >= 200 && response.status < 300) {
+      console.log('Slack通知を送信しました, ステータス:', response.status);
+      return true;
+    } else {
+      console.error('Slack通知送信エラー - 不正なステータスコード:', response.status);
+      return false;
+    }
   } catch (error) {
     console.error('Slack通知の送信に失敗しました:', error.message);
     if (error.response) {
       console.error('レスポンス:', error.response.status, error.response.data);
+    } else if (error.request) {
+      console.error('リクエストは送信されましたが、レスポンスがありませんでした');
+    } else {
+      console.error('リクエスト設定中にエラーが発生しました');
     }
     return false;
   }
@@ -125,7 +160,7 @@ app.post('/webhook', (req, res) => {
 
 // イベントハンドラー
 async function handleEvent(event) {
-  console.log('イベント処理:', event.type, 'イベントデータ:', JSON.stringify(event));
+  console.log('イベント処理:', event.type, 'イベントタイプ:', event.source?.type);
   
   // メッセージイベントのみ処理
   if (event.type !== 'message' || event.message.type !== 'text') {
@@ -159,8 +194,8 @@ async function handleEvent(event) {
     // チャットID (グループ、ルーム、または個別チャットのID)
     const chatId = event.source.groupId || event.source.roomId || userId;
     
-    console.log(`メッセージ情報: userId=${userId}, displayName=${userDisplayName}, ` +
-                `sourceType=${sourceType}, chatId=${chatId}, text=${messageText}`);
+    console.log(`メッセージ情報: userId=${safeUserId(userId)}, displayName=${userDisplayName}, ` +
+                `sourceType=${sourceType}, chatId=${safeUserId(chatId)}, text=${messageText}`);
     
     // 特別コマンド処理: すべて返信済みにする
     if (messageText === '全部返信済み' || messageText === 'すべて返信済み') {
@@ -196,7 +231,7 @@ async function handleEvent(event) {
     // メッセージ履歴に追加
     messageHistory.push(newMessage);
     
-    console.log(`新しいメッセージを保存しました:`, JSON.stringify(newMessage));
+    console.log(`新しいメッセージを保存しました:`, JSON.stringify({...newMessage, userId: safeUserId(userId), chatId: safeUserId(chatId)}));
     console.log(`現在のメッセージ履歴数: ${messageHistory.length}`);
     
     // 特定ユーザー以外からのメッセージに対してSlack通知
@@ -207,9 +242,14 @@ async function handleEvent(event) {
         'room': 'ルーム'
       }[sourceType] || '不明';
       
-      const notificationText = `*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*メッセージID*: ${messageId}`;
-      const notificationSent = await sendSlackNotification(notificationText);
-      console.log('Slack通知送信結果:', notificationSent ? '成功' : '失敗');
+      const notificationText = `*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${userDisplayName}\n*内容*: ${messageText}\n*送信時刻*: ${new Date(timestamp).toLocaleString('ja-JP')}`;
+      
+      try {
+        const notificationSent = await sendSlackNotification(notificationText);
+        console.log('新規メッセージの通知状態:', notificationSent ? '成功' : '失敗');
+      } catch (error) {
+        console.error('通知送信中にエラーが発生しました:', error);
+      }
     } else {
       console.log(`自分からのメッセージを記録しました: ${messageText}`);
       
@@ -259,8 +299,9 @@ cron.schedule('* * * * *', async () => {
         }[msg.sourceType] || '不明';
         
         const elapsedMinutes = Math.floor((now - msg.timestamp) / (60 * 1000));
+        const time = new Date(msg.timestamp).toLocaleString('ja-JP');
         
-        return `*送信者*: ${msg.userDisplayName}\n*送信元*: ${sourceTypeText}\n*内容*: ${msg.messageText}\n*メッセージID*: ${msg.messageId}\n*経過時間*: ${elapsedMinutes}分`;
+        return `*送信者*: ${msg.userDisplayName}\n*送信元*: ${sourceTypeText}\n*内容*: ${msg.messageText}\n*送信時刻*: ${time}\n*経過時間*: ${elapsedMinutes}分`;
       }).join('\n\n');
       
       const notificationText = `*【1分以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`;
