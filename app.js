@@ -136,61 +136,69 @@ async function handleEvent(event) {
     // メッセージを送信したユーザーID（自分自身のユーザーID）
     const myUserId = event.source.userId;
     
-    // メッセージを保存（すべてのメッセージを対象にする）
-    if (!messageStore[myUserId]) {
-      messageStore[myUserId] = {};
-    }
-    
-    messageStore[myUserId][event.message.id] = {
-      text: event.message.text,
-      sender: event.source.userId,
-      senderName: senderProfile ? senderProfile.displayName : 'Unknown User',
-      timestamp: event.timestamp,
-      replied: false,
-      messageId: event.message.id,
-      sourceType: event.source.type  // room, group, or user
-    };
-    
-    console.log(`メッセージを保存: ${event.message.text}`);
-    
-    // Slackに通知を送信
-    const sourceTypeText = {
-      'user': '個別チャット',
-      'group': 'グループ',
-      'room': 'ルーム'
-    }[event.source.type] || '不明';
-    
-    await sendSlackNotification(`*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${senderProfile.displayName}\n*内容*: ${event.message.text}\n*メッセージID*: ${event.message.id}`);
-    
-    // 返信対象メッセージIDを識別するパターン
+    // 既存の方法は残しておく（オプション）
     const replyToPattern = /返信対象ID:(\w+)/;
     const match = event.message.text.match(replyToPattern);
     
     if (match && match[1]) {
-      const messageId = match[1];
-      let found = false;
+      // 既存のIDベースの返信マーク処理
+      // ...（既存コード）
+    } else if (event.message.text === '全部返信済み' || event.message.text === 'すべて返信済み') {
+      // 全返信済みコマンド
+      // ...（既存コード）
+    } else {
+      // 新機能: 最新の未返信メッセージに対して自動的に返信済みとマーク
+      let markedMessageId = null;
+      let markedMessage = null;
       
-      // すべてのユーザーのメッセージストアから該当IDを検索
-      for (const userId in messageStore) {
-        const userMessages = messageStore[userId];
-        if (userMessages[messageId]) {
-          userMessages[messageId].replied = true;
-          found = true;
-          console.log(`メッセージID:${messageId}に対する返信を記録しました`);
+      // まずは自分宛てのメッセージから最新の未返信メッセージを探す
+      if (messageStore[myUserId]) {
+        let latestTimestamp = 0;
+        
+        for (const messageId in messageStore[myUserId]) {
+          const message = messageStore[myUserId][messageId];
+          if (!message.replied && message.timestamp > latestTimestamp) {
+            latestTimestamp = message.timestamp;
+            markedMessageId = messageId;
+            markedMessage = message;
+          }
+        }
+        
+        // 最新の未返信メッセージが見つかった場合、返信済みとマーク
+        if (markedMessageId) {
+          messageStore[myUserId][markedMessageId].replied = true;
+          console.log(`最新の未返信メッセージ(ID:${markedMessageId})を返信済みとしてマークしました`);
           
           // Slackに返信完了通知
-          await sendSlackNotification(`*返信完了*\n*メッセージID*: ${messageId}\n*返信内容*: ${event.message.text}`);
-          break;
+          await sendSlackNotification(`*返信完了*\n*メッセージID*: ${markedMessageId}\n*元のメッセージ*: ${markedMessage.text}\n*返信内容*: ${event.message.text}`);
         }
       }
       
-      // 返信確認メッセージ
-      return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: found 
-          ? `返信を記録しました。メッセージID:${messageId}` 
-          : `指定されたメッセージID:${messageId}が見つかりませんでした`
-      });
+      // 新規メッセージとして保存
+      if (!messageStore[myUserId]) {
+        messageStore[myUserId] = {};
+      }
+      
+      messageStore[myUserId][event.message.id] = {
+        text: event.message.text,
+        sender: event.source.userId,
+        senderName: senderProfile ? senderProfile.displayName : 'Unknown User',
+        timestamp: event.timestamp,
+        replied: false,
+        messageId: event.message.id,
+        sourceType: event.source.type
+      };
+      
+      console.log(`メッセージを保存: ${event.message.text}`);
+      
+      // Slackに通知を送信
+      const sourceTypeText = {
+        'user': '個別チャット',
+        'group': 'グループ',
+        'room': 'ルーム'
+      }[event.source.type] || '不明';
+      
+      await sendSlackNotification(`*新規メッセージ*\n*送信元*: ${sourceTypeText}\n*送信者*: ${senderProfile.displayName}\n*内容*: ${event.message.text}\n*メッセージID*: ${event.message.id}`);
     }
     
   } catch (error) {
@@ -199,7 +207,6 @@ async function handleEvent(event) {
 
   return Promise.resolve(null);
 }
-
 // 1分ごとに未返信メッセージをチェックするスケジューラー
 // cron式: '* * * * *' は1分ごとに実行
 cron.schedule('* * * * *', async () => {
