@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const line = require('@line/bot-sdk');
 const cron = require('node-cron');
 const axios = require('axios');
+const fs = require('fs');
 const app = express();
 
 // LINE API設定
@@ -54,7 +55,43 @@ function logDebug(message) {
   }
 }
 
-// 生のリクエストボディを取得するためのミドルウェア
+// Slack通知用ペイロードをファイルから読み込み、対象のLINEユーザーIDで置換する関数
+function loadSlackPayload(lineUserId) {
+  const filePath = './slack_payload.json';
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const payload = JSON.parse(raw);
+    if (payload.attachments) {
+      payload.attachments.forEach(attachment => {
+        if (attachment.actions) {
+          attachment.actions.forEach(action => {
+            if (action.value === "Uxxxx") {
+              action.value = lineUserId;
+            }
+          });
+        }
+      });
+    }
+    return payload;
+  } catch (error) {
+    console.error('slack_payload.json 読み込みエラー:', error);
+    return null;
+  }
+}
+
+// Slackインタラクティブ通知送信関数
+async function sendSlackInteractiveNotification(lineUserId) {
+  const payload = loadSlackPayload(lineUserId);
+  if (!payload) return;
+  try {
+    const response = await axios.post(SLACK_WEBHOOK_URL, payload);
+    logDebug('Slack インタラクティブ通知送信しました, ステータス: ' + response.status);
+  } catch (error) {
+    console.error('Slack インタラクティブ通知送信エラー:', error.message);
+  }
+}
+
+// ミドルウェア設定
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -64,12 +101,12 @@ app.get('/', (req, res) => {
   res.send('LINE Bot Server is running!');
 });
 
-// GETリクエスト用ハンドラー
+// GET /webhook ハンドラー（デバッグ用）
 app.get('/webhook', (req, res) => {
   res.send('LINE Bot Webhook is working. Please use POST method for actual webhook.');
 });
 
-// Slackに通知を送信する関数
+// Slack通知送信関数（テキスト通知用）
 async function sendSlackNotification(message) {
   if (!SLACK_WEBHOOK_URL) {
     logDebug('Slack Webhook URLが設定されていないため、通知をスキップします');
@@ -87,19 +124,17 @@ async function sendSlackNotification(message) {
   }
 }
 
-// 返信を送信し、その返信IDを会話状態に記録する関数
+// 返信送信関数（独自ID生成を使用）
 async function sendReplyAndRecord(event, messageText) {
   try {
-    // LINE API を使ってメッセージを返信
     await client.replyMessage(event.replyToken, {
       type: 'text',
       text: messageText
     });
-    // 公式APIからメッセージIDが返されないため、独自に一意なIDを生成
+    // 公式APIからはメッセージIDが返らないため、独自にIDを生成
     const botMessageId = crypto.randomBytes(16).toString('hex');
     const userId = event.source.userId;
     logDebug(`ユーザー ${userId} に返信を送信しました。独自生成したメッセージID: ${botMessageId}`);
-    // 会話状態を更新
     if (conversations[userId]) {
       conversations[userId].botReply = {
         text: messageText,
@@ -116,14 +151,13 @@ async function sendReplyAndRecord(event, messageText) {
   }
 }
 
-// プッシュメッセージを送信し、そのIDを会話状態に記録する関数
+// プッシュメッセージ送信関数（独自ID生成）
 async function sendPushMessageAndRecord(userId, messageText) {
   try {
     await client.pushMessage(userId, {
       type: 'text',
       text: messageText
     });
-    // 独自に生成
     const botMessageId = crypto.randomBytes(16).toString('hex');
     logDebug(`ユーザー ${userId} にプッシュメッセージを送信しました。独自生成したメッセージID: ${botMessageId}`);
     if (conversations[userId]) {
@@ -142,7 +176,7 @@ async function sendPushMessageAndRecord(userId, messageText) {
   }
 }
 
-// LINE Bot用Webhookルート - カスタム署名検証
+// LINE Bot Webhookエンドポイント（POST）
 app.post('/webhook', (req, res) => {
   const signature = req.headers['x-line-signature'];
   if (!signature) {
@@ -173,7 +207,7 @@ app.post('/webhook', (req, res) => {
     });
 });
 
-// イベントハンドラー
+// LINEイベントハンドラー
 async function handleEvent(event) {
   logDebug('イベント処理: ' + event.type + ' - イベントID: ' + (event.webhookEventId || 'なし'));
   if (event.type !== 'message' || event.message.type !== 'text') {
@@ -202,16 +236,16 @@ async function handleEvent(event) {
     const userDisplayName = senderProfile ? senderProfile.displayName : 'Unknown User';
     const sourceType = event.source.type;
     
-    // 緊急コマンド: リセット
+    // 緊急コマンド: "リセット"
     if (isFromUser && messageText === 'リセット') {
       Object.keys(conversations).forEach(uid => {
         conversations[uid].needsReply = false;
       });
-      await sendSlackNotification(`*システムリセット*\n*ユーザー*: ${userDisplayName}\nすべてのユーザーの未返信状態をリセットしました。`);
+      await sendSlackNotification(`*システムリセット*\n*ユーザー*: ${userDisplayName}\nすべての未返信状態をリセットしました。`);
       return sendReplyAndRecord(event, "システムをリセットしました。すべての未返信状態がクリアされました。");
     }
     
-    // 特別コマンド: 返信済みマーク
+    // 特別コマンド: "全部返信済み" または "返信済み"
     if (isFromUser && (messageText === '全部返信済み' || messageText === 'すべて返信済み' || messageText === '返信済み')) {
       if (conversations[userId]) {
         conversations[userId].needsReply = false;
@@ -220,7 +254,7 @@ async function handleEvent(event) {
       return sendReplyAndRecord(event, "未返信状態をクリアしました。");
     }
     
-    // 特別コマンド: ステータスチェック
+    // 特別コマンド: "ステータス" または "status"
     if (isFromUser && (messageText === 'ステータス' || messageText === 'status')) {
       const needsReply = conversations[userId] && conversations[userId].needsReply;
       let statusMessage;
@@ -238,7 +272,7 @@ async function handleEvent(event) {
       return sendReplyAndRecord(event, statusMessage);
     }
     
-    // 特別コマンド: デバッグログ表示
+    // 特別コマンド: "デバッグログ" または "debuglog"
     if (isFromUser && (messageText === 'デバッグログ' || messageText === 'debuglog')) {
       let pendingCount = 0;
       for (const uid in conversations) {
@@ -250,7 +284,7 @@ async function handleEvent(event) {
       return sendReplyAndRecord(event, logMessage);
     }
     
-    // 会話状態の更新
+    // 通常のメッセージの場合、会話状態を更新
     if (isFromUser) {
       if (!conversations[userId]) {
         conversations[userId] = {
@@ -276,7 +310,34 @@ async function handleEvent(event) {
   return Promise.resolve(null);
 }
 
-// 外部から返信を送信するエンドポイント
+// Slackインタラクティブメッセージ処理用エンドポイント
+// Slackからのリクエストは x-www-form-urlencoded 形式で、ペイロードは req.body.payload にJSON文字列として含まれます
+app.post('/slack/actions', express.urlencoded({ extended: true }), async (req, res) => {
+  try {
+    const payload = JSON.parse(req.body.payload);
+    logDebug('Slack interactive action payload: ' + JSON.stringify(payload));
+    if (payload.callback_id === "mark_as_replied") {
+      const action = payload.actions[0];
+      // ボタンの value に対象のLINEユーザーIDがセットされている前提
+      const lineUserId = action.value;
+      logDebug(`Slackボタンが押されました。対象のLINEユーザーID: ${lineUserId}`);
+      if (conversations[lineUserId]) {
+        conversations[lineUserId].needsReply = false;
+        logDebug(`ユーザー ${lineUserId} の会話をSlackアクションにより返信済みとマークしました`);
+        return res.json({ text: "未返信リマインダーを停止しました。" });
+      } else {
+        return res.json({ text: "該当の会話が見つかりませんでした。" });
+      }
+    } else {
+      res.status(400).send('不明なコールバックIDです');
+    }
+  } catch (error) {
+    console.error('Slackアクション処理エラー:', error);
+    res.status(500).send('内部エラー');
+  }
+});
+
+// 外部から返信送信するエンドポイント
 app.post('/api/send-reply', express.json(), async (req, res) => {
   const { userId, message } = req.body;
   if (!userId || !message) {
@@ -341,7 +402,7 @@ app.post('/api/verify-bot-reply', express.json(), async (req, res) => {
   }
 });
 
-// 1分ごとに未返信メッセージをチェックするスケジューラー
+// 1分ごとの未返信チェック（各ユーザーに対してインタラクティブ通知を送信）
 let isCheckingUnreplied = false;
 cron.schedule('* * * * *', async () => {
   if (isCheckingUnreplied) {
@@ -371,17 +432,9 @@ cron.schedule('* * * * *', async () => {
       }
     }
     logDebug(`未返信ユーザー数: ${unrepliedUsers.length}`);
-    if (unrepliedUsers.length > 0) {
-      try {
-        const reminderText = unrepliedUsers.map(user => {
-          const sourceTypeText = { 'user': '個別チャット', 'group': 'グループ', 'room': 'ルーム' }[user.sourceType] || '不明';
-          return `*送信者*: ${user.name}\n*送信元*: ${sourceTypeText}\n*内容*: ${user.message.text}\n*メッセージID*: ${user.message.id}\n*経過時間*: ${user.elapsedMinutes}分\n*ユーザーID*: ${user.userId}`;
-        }).join('\n\n');
-        await sendSlackNotification(`*【1分以上未返信リマインダー】*\n以下のメッセージに返信がありません:\n\n${reminderText}`);
-        logDebug(`${unrepliedUsers.length}件のリマインダーをSlackに送信しました`);
-      } catch (error) {
-        console.error('Slackリマインダー送信エラー:', error);
-      }
+    // ここでは各未返信ユーザーに対して個別にSlackインタラクティブ通知を送信
+    for (const user of unrepliedUsers) {
+      await sendSlackInteractiveNotification(user.userId);
     }
   } catch (error) {
     console.error('未返信チェックエラー:', error);
@@ -390,7 +443,7 @@ cron.schedule('* * * * *', async () => {
   }
 });
 
-// 6時間ごとに古いデータをクリーンアップするスケジューラー
+// 6時間ごとの古いデータのクリーンアップ
 cron.schedule('0 */6 * * *', () => {
   logDebug('古いメッセージデータをクリーンアップしています...');
   const now = Date.now();
@@ -406,7 +459,7 @@ cron.schedule('0 */6 * * *', () => {
   logDebug(`${cleanupCount}件の古い会話をクリーンアップしました`);
 });
 
-// 現在の会話状態を表示するエンドポイント
+// 会話状態表示エンドポイント
 app.get('/api/conversations', (req, res) => {
   let pendingCount = 0;
   for (const uid in conversations) {
@@ -422,7 +475,7 @@ app.get('/api/conversations', (req, res) => {
   });
 });
 
-// デバッグログを表示するエンドポイント
+// デバッグログ表示エンドポイント
 app.get('/api/debug-logs', (req, res) => {
   res.json({ success: true, count: debugLogs.length, logs: debugLogs });
 });
