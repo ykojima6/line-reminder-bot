@@ -10,7 +10,7 @@
           "name": "mark",
           "text": "返事した",
           "type": "button",
-          "value": "Uxxxx"  // この部分は後で動的に置換されます
+          "value": "Uxxxx"
         }
       ]
     }
