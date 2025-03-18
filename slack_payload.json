@@ -1,0 +1,18 @@
+{
+  "text": "*【1分以上未返信リマインダー】*\n以下のメッセージに返信がありません:",
+  "attachments": [
+    {
+      "text": "このメッセージは返信が必要です。返信済みにする場合は下のボタンを押してください。",
+      "fallback": "返事済みボタン",
+      "callback_id": "mark_as_replied",
+      "actions": [
+        {
+          "name": "mark",
+          "text": "返事した",
+          "type": "button",
+          "value": "Uxxxx"  // この部分は後で動的に置換されます
+        }
+      ]
+    }
+  ]
+}
