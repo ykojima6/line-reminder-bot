@@ -452,6 +452,26 @@ app.get('/api/all-conversations', (req, res) => {
   });
 });
 
+// 公式LINEで送信したボットのメッセージIDを検証して返信済みとマークするエンドポイント
+app.post('/api/verify-bot-reply', express.json(), async (req, res) => {
+  const { userId, botMessageId } = req.body;
+  if (!userId || !botMessageId) {
+    return res.status(400).json({ success: false, error: 'userId と botMessageId は必須です' });
+  }
+  
+  if (!conversations[userId]) {
+    return res.status(404).json({ success: false, error: `ユーザー ${userId} の会話が見つかりません` });
+  }
+  
+  if (conversations[userId].botReply && conversations[userId].botReply.id === botMessageId) {
+    conversations[userId].needsReply = false;
+    logDebug(`ユーザー ${userId} の会話を、botMessageId の検証により返信済みとマークしました`);
+    return res.status(200).json({ success: true, message: `ユーザー ${userId} の会話を返信済みとマークしました` });
+  } else {
+    return res.status(400).json({ success: false, error: '指定された botMessageId は記録されている返信と一致しません' });
+  }
+});
+
 // 1分ごとに未返信メッセージをチェックするスケジューラー
 let isCheckingUnreplied = false; // 実行中フラグ
 
