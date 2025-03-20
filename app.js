@@ -24,10 +24,13 @@ if (!SLACK_WEBHOOK_URL) {
   console.warn('警告: SLACK_WEBHOOK_URL が設定されていません。Slack通知は無効になります');
 }
 
+const APP_BASE_URL = process.env.APP_BASE_URL || 'https://your-app-url.herokuapp.com';
+
 console.log('環境変数の状態:');
 console.log('LINE_CHANNEL_ACCESS_TOKEN exists:', !!config.channelAccessToken);
 console.log('LINE_CHANNEL_SECRET exists:', !!config.channelSecret);
 console.log('SLACK_WEBHOOK_URL exists:', !!SLACK_WEBHOOK_URL);
+console.log('APP_BASE_URL:', APP_BASE_URL);
 
 const client = new line.Client(config);
 
@@ -66,46 +69,32 @@ app.use(express.urlencoded({ extended: true }));
 // 5) Slack通知用のヘルパー
 // ---------------------------------------------------
 
-// (A) slack_payload.json を読み込み、"Uxxxx" を lineUserId に置換 & カスタムテキストを設定
-function loadSlackPayload(lineUserId, customText) {
-  try {
-    const raw = fs.readFileSync('./slack_payload.json', 'utf8');
-    const payload = JSON.parse(raw);
-    // customText が渡されていれば本文を上書き
-    if (customText) {
-      payload.text = `*【LINEからの新着メッセージ】*\n${customText}`;
-    }
-    if (payload.attachments) {
-      payload.attachments.forEach(attachment => {
-        if (attachment.actions) {
-          attachment.actions.forEach(action => {
-            if (action.value === 'Uxxxx') {
-              action.value = lineUserId;
-            }
-          });
-        }
-      });
-    }
-    return payload;
-  } catch (error) {
-    console.error('slack_payload.json 読み込みエラー:', error);
-    return null;
-  }
+// (A) 直接テキストメッセージとリンクを作成
+function createSlackMessage(lineUserId, customText, isReminder = false) {
+  const markAsRepliedUrl = `${APP_BASE_URL}/api/mark-as-replied-web?userId=${lineUserId}`;
+  
+  let prefix = isReminder ? '*【リマインダー】*\n' : '*【LINEからの新着メッセージ】*\n';
+  
+  return {
+    text: `${prefix}${customText}\n\n<${markAsRepliedUrl}|👉 返信済みにする>`,
+    unfurl_links: false
+  };
 }
 
-// (B) インタラクティブ通知を送る
-async function sendSlackInteractiveNotification(lineUserId, customText) {
+// (B) インタラクティブ通知を送る（修正版）
+async function sendSlackInteractiveNotification(lineUserId, customText, isReminder = false) {
   if (!SLACK_WEBHOOK_URL) {
     logDebug('Slack Webhook URLが未設定のため送信できません');
     return;
   }
-  const payload = loadSlackPayload(lineUserId, customText);
-  if (!payload) return;
+  
+  const message = createSlackMessage(lineUserId, customText, isReminder);
+  
   try {
-    const response = await axios.post(SLACK_WEBHOOK_URL, payload);
-    logDebug(`Slackインタラクティブ通知送信成功: ${response.status}`);
+    const response = await axios.post(SLACK_WEBHOOK_URL, message);
+    logDebug(`Slack通知送信成功: ${response.status}`);
   } catch (error) {
-    logDebug(`Slackインタラクティブ通知送信失敗: ${error.message}`);
+    logDebug(`Slack通知送信失敗: ${error.message}`);
   }
 }
 
@@ -261,56 +250,45 @@ async function replyAndRecord(event, replyText) {
 }
 
 // ---------------------------------------------------
-// 8) Slackアクション受信用エンドポイント（返事したボタン）
+// 8) Web用返信済みマーク設定エンドポイント（新規追加）
 // ---------------------------------------------------
-app.post('/slack/actions', express.urlencoded({ extended: true }), (req, res) => {
+app.get('/api/mark-as-replied-web', (req, res) => {
+  const { userId } = req.query;
+  if (!userId) {
+    return res.send('エラー: ユーザーIDが指定されていません');
+  }
+  
+  if (!conversations[userId]) {
+    return res.send('エラー: 該当のユーザーが見つかりません');
+  }
+  
   try {
-    // デバッグ用にリクエスト本文全体をログに記録
-    logDebug(`Slackアクション受信 raw body: ${JSON.stringify(req.body)}`);
+    conversations[userId].needsReply = false;
+    logDebug(`会話更新（Web経由）: userId=${userId} を返信済みに設定`);
     
-    const payload = JSON.parse(req.body.payload || '{}');
-    logDebug(`Slackアクション受信 parsed: ${JSON.stringify(payload)}`);
-
-    // callback_idが存在するか確認
-    if (!payload.callback_id) {
-      logDebug('callback_id が見つかりません');
-      return res.status(200).json({ text: "処理できませんでした。システム管理者に連絡してください。" });
-    }
-
-    if (payload.callback_id === 'mark_as_replied') {
-      // アクションが存在するか確認
-      if (!payload.actions || !payload.actions.length) {
-        logDebug('アクションが見つかりません');
-        return res.status(200).json({ text: "アクションが見つかりません。" });
-      }
-
-      const action = payload.actions[0];
-      const lineUserId = action.value;
-      
-      // lineUserIdが有効か確認
-      if (!lineUserId) {
-        logDebug('LINEユーザーIDが見つかりません');
-        return res.status(200).json({ text: "ユーザーIDが無効です。" });
-      }
-
-      logDebug(`「返事した」ボタン押下: lineUserId=${lineUserId}`);
-      
-      if (conversations[lineUserId]) {
-        conversations[lineUserId].needsReply = false;
-        logDebug(`会話更新: userId=${lineUserId} を返信済みに設定`);
-        return res.json({ text: "返信済みにしました。" });
-      } else {
-        logDebug(`該当会話なし: userId=${lineUserId}`);
-        return res.json({ text: "該当の会話が見つかりませんでした。" });
-      }
-    } else {
-      logDebug('不明な callback_id: ' + payload.callback_id);
-      return res.status(200).json({ text: "不明なアクションです。" });
-    }
+    // 成功ページをレンダリング
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>返信済みに設定しました</title>
+        <style>
+          body { font-family: sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; text-align: center; }
+          .success { color: #4CAF50; font-size: 24px; margin: 20px 0; }
+          .info { margin: 20px 0; color: #555; }
+        </style>
+      </head>
+      <body>
+        <div class="success">✅ 返信済みに設定しました</div>
+        <div class="info">このウィンドウは閉じて構いません</div>
+      </body>
+      </html>
+    `);
   } catch (error) {
-    logDebug(`Slackアクション処理エラー: ${error.message}`);
-    // エラーが発生してもユーザーに200を返し、フレンドリーなメッセージを表示
-    return res.status(200).json({ text: "処理中にエラーが発生しました。もう一度お試しください。" });
+    logDebug(`Web経由の返信済み処理エラー: ${error.message}`);
+    res.send('エラー: 処理中に問題が発生しました');
   }
 });
 
@@ -384,9 +362,9 @@ cron.schedule('* * * * *', async () => {
 
     // 各未返信ユーザーに対して、詳細なリマインダー通知を送信
     for (const entry of unreplied) {
-      const customText = `リマインダー: ${entry.displayName}さんからのメッセージ「${entry.text}」にまだ返信がありません。`;
+      const customText = `${entry.displayName}さんからのメッセージ「${entry.text}」にまだ返信がありません。`;
       logDebug(`リマインダー送信: userId=${entry.userId}, message="${entry.text}"`);
-      await sendSlackInteractiveNotification(entry.userId, customText);
+      await sendSlackInteractiveNotification(entry.userId, customText, true);
     }
   } catch (error) {
     logDebug(`未返信チェックエラー: ${error.message}`);
