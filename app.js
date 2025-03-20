@@ -341,20 +341,22 @@ app.post('/api/mark-as-replied', express.json(), (req, res) => {
 });
 
 // ---------------------------------------------------
-// 10) 定期的な未返信チェック（1分ごと）
+// 10) 定期的な未返信チェック（15分ごと）
 // ---------------------------------------------------
 let isCheckingUnreplied = false;
-cron.schedule('* * * * *', async () => {
+// 毎時00分、15分、30分、45分に実行するようにスケジュールを変更
+cron.schedule('0,15,30,45 * * * *', async () => {
   if (isCheckingUnreplied) {
     logDebug('前回の未返信チェック中のためスキップ');
     return;
   }
   isCheckingUnreplied = true;
-  logDebug('1分ごとの未返信チェック開始');
+  logDebug('未返信チェック開始');
 
   try {
     const now = Date.now();
-    const oneMinuteMs = 60 * 1000;
+    // 3時間をミリ秒に変換（3時間 × 60分 × 60秒 × 1000ミリ秒）
+    const threeHoursMs = 3 * 60 * 60 * 1000;
     const unreplied = [];
 
     for (const userId in conversations) {
@@ -362,23 +364,33 @@ cron.schedule('* * * * *', async () => {
       // グループメッセージは未返信リマインダーから除外
       if (c.needsReply && c.userMessage && (c.sourceType !== 'group' && c.sourceType !== 'room')) {
         const diff = now - c.userMessage.timestamp;
-        if (diff >= oneMinuteMs) {
+        // 3時間以上経過しているメッセージのみリマインダー対象に
+        if (diff >= threeHoursMs) {
           unreplied.push({
             userId,
             displayName: c.displayName,
             text: c.userMessage.text,
-            timestamp: c.userMessage.timestamp
+            timestamp: c.userMessage.timestamp,
+            // 経過時間を分単位で計算
+            elapsedMinutes: Math.floor(diff / (60 * 1000))
           });
         }
       }
     }
 
-    logDebug(`未返信ユーザー数: ${unreplied.length}`);
+    logDebug(`3時間以上未返信のユーザー数: ${unreplied.length}`);
 
     // 各未返信ユーザーに対して、詳細なリマインダー通知を送信
     for (const entry of unreplied) {
-      const customText = `${entry.displayName}さんからのメッセージ「${entry.text}」にまだ返信がありません。`;
-      logDebug(`リマインダー送信: userId=${entry.userId}, message="${entry.text}"`);
+      // 経過時間を時間と分で表示
+      const hours = Math.floor(entry.elapsedMinutes / 60);
+      const minutes = entry.elapsedMinutes % 60;
+      const elapsedTimeText = hours > 0 
+        ? `${hours}時間${minutes > 0 ? `${minutes}分` : ''}`
+        : `${minutes}分`;
+        
+      const customText = `${entry.displayName}さんからのメッセージ「${entry.text}」に${elapsedTimeText}返信がありません。`;
+      logDebug(`リマインダー送信: userId=${entry.userId}, message="${entry.text}", 経過時間=${elapsedTimeText}`);
       await sendSlackInteractiveNotification(entry.userId, customText, true);
     }
   } catch (error) {
