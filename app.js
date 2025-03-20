@@ -24,7 +24,7 @@ if (!SLACK_WEBHOOK_URL) {
   console.warn('警告: SLACK_WEBHOOK_URL が設定されていません。Slack通知は無効になります');
 }
 
-const APP_BASE_URL = process.env.APP_BASE_URL || 'https://your-app-url.herokuapp.com';
+const APP_BASE_URL = process.env.APP_BASE_URL || 'https://line-reminder-bot-de113f80aa92.herokuapp.com';
 
 console.log('環境変数の状態:');
 console.log('LINE_CHANNEL_ACCESS_TOKEN exists:', !!config.channelAccessToken);
