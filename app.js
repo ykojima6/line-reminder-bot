@@ -24,7 +24,7 @@ if (!SLACK_WEBHOOK_URL) {
   console.warn('警告: SLACK_WEBHOOK_URL が設定されていません。Slack通知は無効になります');
 }
 
-const APP_BASE_URL = process.env.APP_BASE_URL || 'https://line-reminder-bot-de113f80aa92.herokuapp.com';
+const APP_BASE_URL = process.env.APP_BASE_URL || 'https://your-app-url.herokuapp.com';
 
 console.log('環境変数の状態:');
 console.log('LINE_CHANNEL_ACCESS_TOKEN exists:', !!config.channelAccessToken);
@@ -158,8 +158,21 @@ async function handleLineEvent(event) {
   const messageId = event.message.id;
   const timestamp = event.timestamp;
   const isFromUser = !!event.replyToken;
+  const sourceType = event.source.type;
 
-  logDebug(`受信: userId=${userId}, text="${messageText}", isFromUser=${isFromUser}`);
+  logDebug(`受信: userId=${userId}, sourceType=${sourceType}, text="${messageText}", isFromUser=${isFromUser}`);
+
+  // グループからのメッセージは無視する（特定のコマンドは処理）
+  if (sourceType === 'group' || sourceType === 'room') {
+    // 特定のコマンドのみ処理
+    if (['ステータス', 'status', 'デバッグログ', 'debuglog', 'リセット', '返信済み', '全部返信済み', 'すべて返信済み'].includes(messageText)) {
+      logDebug(`グループ/ルームからのコマンド: ${messageText}`);
+      // コマンド処理は続行
+    } else {
+      logDebug(`グループ/ルームからの通常メッセージのため処理をスキップ: ${sourceType}`);
+      return;
+    }
+  }
 
   // プロフィール取得
   let displayName = 'Unknown User';
@@ -208,6 +221,7 @@ async function handleLineEvent(event) {
   }
 
   // 通常のメッセージの場合、会話状態を更新し新着メッセージ用のSlack通知を送信
+  // グループメッセージは上で既にフィルターされているので、ここでの sourceType チェックは不要
   if (isFromUser) {
     if (!conversations[userId]) {
       conversations[userId] = {
@@ -215,7 +229,7 @@ async function handleLineEvent(event) {
         botReply: null,
         needsReply: true,
         displayName,
-        sourceType: event.source.type
+        sourceType
       };
       logDebug(`新規会話作成: userId=${userId}, text="${messageText}"`);
     } else {
@@ -345,7 +359,8 @@ cron.schedule('* * * * *', async () => {
 
     for (const userId in conversations) {
       const c = conversations[userId];
-      if (c.needsReply && c.userMessage) {
+      // グループメッセージは未返信リマインダーから除外
+      if (c.needsReply && c.userMessage && (c.sourceType !== 'group' && c.sourceType !== 'room')) {
         const diff = now - c.userMessage.timestamp;
         if (diff >= oneMinuteMs) {
           unreplied.push({
