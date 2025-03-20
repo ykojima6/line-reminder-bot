@@ -42,7 +42,9 @@ const client = new line.Client(config);
 //    botReply: { text, timestamp, id },
 //    needsReply: boolean,
 //    displayName: string,
-//    sourceType: string
+//    sourceType: string,
+//    lastReminderTime: number, // 最後にリマインダーを送信した時間
+//    reminderCount: number     // リマインダーの送信回数
 // } }
 const conversations = {};
 
@@ -70,10 +72,10 @@ app.use(express.urlencoded({ extended: true }));
 // ---------------------------------------------------
 
 // (A) 直接テキストメッセージとリンクを作成
-function createSlackMessage(lineUserId, customText, isReminder = false) {
+function createSlackMessage(lineUserId, customText, isReminder = false, reminderCount = 0) {
   const markAsRepliedUrl = `${APP_BASE_URL}/api/mark-as-replied-web?userId=${lineUserId}`;
   
-  let prefix = isReminder ? '*【リマインダー】*\n' : '*【LINEからの新着メッセージ】*\n';
+  let prefix = isReminder ? `*【リマインダー ${reminderCount > 0 ? `#${reminderCount}` : ''}】*\n` : '*【LINEからの新着メッセージ】*\n';
   
   return {
     text: `${prefix}${customText}\n\n<${markAsRepliedUrl}|👉 返信済みにする>`,
@@ -82,13 +84,13 @@ function createSlackMessage(lineUserId, customText, isReminder = false) {
 }
 
 // (B) インタラクティブ通知を送る（修正版）
-async function sendSlackInteractiveNotification(lineUserId, customText, isReminder = false) {
+async function sendSlackInteractiveNotification(lineUserId, customText, isReminder = false, reminderCount = 0) {
   if (!SLACK_WEBHOOK_URL) {
     logDebug('Slack Webhook URLが未設定のため送信できません');
     return;
   }
   
-  const message = createSlackMessage(lineUserId, customText, isReminder);
+  const message = createSlackMessage(lineUserId, customText, isReminder, reminderCount);
   
   try {
     const response = await axios.post(SLACK_WEBHOOK_URL, message);
@@ -229,12 +231,16 @@ async function handleLineEvent(event) {
         botReply: null,
         needsReply: true,
         displayName,
-        sourceType
+        sourceType,
+        lastReminderTime: 0,     // 最後にリマインダーを送信した時間（初期値：0）
+        reminderCount: 0         // リマインダーの送信回数（初期値：0）
       };
       logDebug(`新規会話作成: userId=${userId}, text="${messageText}"`);
     } else {
       conversations[userId].userMessage = { text: messageText, timestamp, id: messageId };
       conversations[userId].needsReply = true;
+      conversations[userId].lastReminderTime = 0; // 新しいメッセージでリセット
+      conversations[userId].reminderCount = 0;    // 新しいメッセージでリセット
       logDebug(`既存会話更新: userId=${userId}, text="${messageText}"`);
     }
     // 新着メッセージ用のインタラクティブ通知（即時送信）
@@ -256,6 +262,8 @@ async function replyAndRecord(event, replyText) {
         id: botMessageId
       };
       conversations[userId].needsReply = false;
+      conversations[userId].lastReminderTime = 0;  // リマインダー情報をリセット
+      conversations[userId].reminderCount = 0;     // リマインダー情報をリセット
       logDebug(`replyAndRecord: userId=${userId}, reply="${replyText}"`);
     }
   } catch (error) {
@@ -278,6 +286,8 @@ app.get('/api/mark-as-replied-web', (req, res) => {
   
   try {
     conversations[userId].needsReply = false;
+    conversations[userId].lastReminderTime = 0;  // リマインダー情報をリセット
+    conversations[userId].reminderCount = 0;     // リマインダー情報をリセット
     logDebug(`会話更新（Web経由）: userId=${userId} を返信済みに設定`);
     
     // 成功ページをレンダリング
@@ -320,6 +330,8 @@ app.post('/api/send-reply', express.json(), async (req, res) => {
     if (conversations[userId]) {
       conversations[userId].botReply = { text: message, timestamp: Date.now(), id: botMessageId };
       conversations[userId].needsReply = false;
+      conversations[userId].lastReminderTime = 0;  // リマインダー情報をリセット
+      conversations[userId].reminderCount = 0;     // リマインダー情報をリセット
     }
     return res.json({ success: true, message: '送信成功', botMessageId });
   } catch (error) {
@@ -337,6 +349,8 @@ app.post('/api/mark-as-replied', express.json(), (req, res) => {
     return res.status(404).json({ success: false, message: '該当の会話が見つかりません' });
   }
   conversations[userId].needsReply = false;
+  conversations[userId].lastReminderTime = 0;  // リマインダー情報をリセット
+  conversations[userId].reminderCount = 0;     // リマインダー情報をリセット
   return res.json({ success: true, message: '返信済みにしました' });
 });
 
@@ -363,35 +377,47 @@ cron.schedule('0,15,30,45 * * * *', async () => {
       const c = conversations[userId];
       // グループメッセージは未返信リマインダーから除外
       if (c.needsReply && c.userMessage && (c.sourceType !== 'group' && c.sourceType !== 'room')) {
-        const diff = now - c.userMessage.timestamp;
-        // 3時間以上経過しているメッセージのみリマインダー対象に
-        if (diff >= threeHoursMs) {
+        const timeSinceMessage = now - c.userMessage.timestamp;
+        const timeSinceLastReminder = now - (c.lastReminderTime || 0);
+        
+        // 初回のリマインダー（3時間以上経過している、かつリマインダー未送信）
+        // または、直近のリマインダーから3時間以上経過している場合
+        if ((timeSinceMessage >= threeHoursMs && !c.lastReminderTime) || 
+            (c.lastReminderTime && timeSinceLastReminder >= threeHoursMs)) {
           unreplied.push({
             userId,
             displayName: c.displayName,
             text: c.userMessage.text,
             timestamp: c.userMessage.timestamp,
-            // 経過時間を分単位で計算
-            elapsedMinutes: Math.floor(diff / (60 * 1000))
+            timeSinceMessage,
+            reminderCount: (c.reminderCount || 0) + 1
           });
         }
       }
     }
 
-    logDebug(`3時間以上未返信のユーザー数: ${unreplied.length}`);
+    logDebug(`リマインダーが必要なユーザー数: ${unreplied.length}`);
 
-    // 各未返信ユーザーに対して、詳細なリマインダー通知を送信
+    // 各未返信ユーザーに対して、リマインダー通知を送信
     for (const entry of unreplied) {
       // 経過時間を時間と分で表示
-      const hours = Math.floor(entry.elapsedMinutes / 60);
-      const minutes = entry.elapsedMinutes % 60;
-      const elapsedTimeText = hours > 0 
-        ? `${hours}時間${minutes > 0 ? `${minutes}分` : ''}`
-        : `${minutes}分`;
+      const hoursTotal = Math.floor(entry.timeSinceMessage / (60 * 60 * 1000));
+      const minutesTotal = Math.floor((entry.timeSinceMessage % (60 * 60 * 1000)) / (60 * 1000));
+      
+      const elapsedTimeText = hoursTotal > 0 
+        ? `${hoursTotal}時間${minutesTotal > 0 ? `${minutesTotal}分` : ''}`
+        : `${minutesTotal}分`;
         
       const customText = `${entry.displayName}さんからのメッセージ「${entry.text}」に${elapsedTimeText}返信がありません。`;
-      logDebug(`リマインダー送信: userId=${entry.userId}, message="${entry.text}", 経過時間=${elapsedTimeText}`);
-      await sendSlackInteractiveNotification(entry.userId, customText, true);
+      logDebug(`リマインダー#${entry.reminderCount}送信: userId=${entry.userId}, message="${entry.text}", 経過時間=${elapsedTimeText}`);
+      
+      await sendSlackInteractiveNotification(entry.userId, customText, true, entry.reminderCount);
+      
+      // リマインダー情報を更新
+      if (conversations[entry.userId]) {
+        conversations[entry.userId].lastReminderTime = now;
+        conversations[entry.userId].reminderCount = entry.reminderCount;
+      }
     }
   } catch (error) {
     logDebug(`未返信チェックエラー: ${error.message}`);
