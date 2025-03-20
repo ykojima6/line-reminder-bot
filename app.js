@@ -265,13 +265,36 @@ async function replyAndRecord(event, replyText) {
 // ---------------------------------------------------
 app.post('/slack/actions', express.urlencoded({ extended: true }), (req, res) => {
   try {
-    const payload = JSON.parse(req.body.payload);
-    logDebug(`Slackアクション受信: ${JSON.stringify(payload)}`);
+    // デバッグ用にリクエスト本文全体をログに記録
+    logDebug(`Slackアクション受信 raw body: ${JSON.stringify(req.body)}`);
+    
+    const payload = JSON.parse(req.body.payload || '{}');
+    logDebug(`Slackアクション受信 parsed: ${JSON.stringify(payload)}`);
+
+    // callback_idが存在するか確認
+    if (!payload.callback_id) {
+      logDebug('callback_id が見つかりません');
+      return res.status(200).json({ text: "処理できませんでした。システム管理者に連絡してください。" });
+    }
 
     if (payload.callback_id === 'mark_as_replied') {
+      // アクションが存在するか確認
+      if (!payload.actions || !payload.actions.length) {
+        logDebug('アクションが見つかりません');
+        return res.status(200).json({ text: "アクションが見つかりません。" });
+      }
+
       const action = payload.actions[0];
       const lineUserId = action.value;
+      
+      // lineUserIdが有効か確認
+      if (!lineUserId) {
+        logDebug('LINEユーザーIDが見つかりません');
+        return res.status(200).json({ text: "ユーザーIDが無効です。" });
+      }
+
       logDebug(`「返事した」ボタン押下: lineUserId=${lineUserId}`);
+      
       if (conversations[lineUserId]) {
         conversations[lineUserId].needsReply = false;
         logDebug(`会話更新: userId=${lineUserId} を返信済みに設定`);
@@ -282,11 +305,12 @@ app.post('/slack/actions', express.urlencoded({ extended: true }), (req, res) =>
       }
     } else {
       logDebug('不明な callback_id: ' + payload.callback_id);
-      return res.status(400).send('不明なコールバックIDです');
+      return res.status(200).json({ text: "不明なアクションです。" });
     }
   } catch (error) {
     logDebug(`Slackアクション処理エラー: ${error.message}`);
-    return res.status(500).send('内部エラー');
+    // エラーが発生してもユーザーに200を返し、フレンドリーなメッセージを表示
+    return res.status(200).json({ text: "処理中にエラーが発生しました。もう一度お試しください。" });
   }
 });
 
