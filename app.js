@@ -457,6 +457,11 @@ app.get('/api/debug-logs', (req, res) => {
   res.json({ success: true, logs: debugLogs });
 });
 
+// シンプルなpingエンドポイント
+app.get('/ping', (req, res) => {
+  res.status(200).send('pong');
+});
+
 // ---------------------------------------------------
 // 13) サーバー起動
 // ---------------------------------------------------
