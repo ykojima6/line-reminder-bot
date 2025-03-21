@@ -167,7 +167,7 @@ async function handleLineEvent(event) {
   // グループからのメッセージは無視する（特定のコマンドは処理）
   if (sourceType === 'group' || sourceType === 'room') {
     // 特定のコマンドのみ処理
-    if (['ステータス', 'status', 'デバッグログ', 'debuglog', 'リセット', '返信済み', '全部返信済み', 'すべて返信済み'].includes(messageText)) {
+    if (['ステータス', 'status', 'デバッグログ', 'debuglog'].includes(messageText)) {
       logDebug(`グループ/ルームからのコマンド: ${messageText}`);
       // コマンド処理は続行
     } else {
@@ -195,16 +195,6 @@ async function handleLineEvent(event) {
 
   // 特殊コマンド判定
   if (isFromUser) {
-    if (messageText === 'リセット') {
-      Object.keys(conversations).forEach(uid => { conversations[uid].needsReply = false; });
-      await sendSlackNotification(`「リセット」コマンド: ${displayName} の全未返信をクリア`);
-      return replyAndRecord(event, '全ての未返信状態をリセットしました。');
-    }
-    if (['全部返信済み', 'すべて返信済み', '返信済み'].includes(messageText)) {
-      if (conversations[userId]) conversations[userId].needsReply = false;
-      await sendSlackNotification(`「返信済み」コマンド: ${displayName} の未返信をクリア`);
-      return replyAndRecord(event, '未返信状態をクリアしました。');
-    }
     if (['ステータス', 'status'].includes(messageText)) {
       const c = conversations[userId];
       let statusMessage = c && c.needsReply
@@ -213,12 +203,12 @@ async function handleLineEvent(event) {
       if (c && c.botReply) {
         statusMessage += `\n最後の返信: "${c.botReply.text}"\n時間: ${new Date(c.botReply.timestamp).toLocaleString('ja-JP')}`;
       }
-      return replyAndRecord(event, statusMessage);
+      return client.replyMessage(event.replyToken, { type: 'text', text: statusMessage });
     }
     if (['デバッグログ', 'debuglog'].includes(messageText)) {
       const pendingCount = Object.values(conversations).filter(c => c.needsReply).length;
       const logPreview = debugLogs.slice(0, 5).join('\n');
-      return replyAndRecord(event, `未返信ユーザー数: ${pendingCount}\n最新ログ:\n${logPreview}`);
+      return client.replyMessage(event.replyToken, { type: 'text', text: `未返信ユーザー数: ${pendingCount}\n最新ログ:\n${logPreview}` });
     }
   }
 
@@ -249,30 +239,8 @@ async function handleLineEvent(event) {
   }
 }
 
-// 返信して会話状態を更新するヘルパー
-async function replyAndRecord(event, replyText) {
-  try {
-    await client.replyMessage(event.replyToken, { type: 'text', text: replyText });
-    const userId = event.source.userId;
-    if (conversations[userId]) {
-      const botMessageId = crypto.randomBytes(16).toString('hex');
-      conversations[userId].botReply = {
-        text: replyText,
-        timestamp: Date.now(),
-        id: botMessageId
-      };
-      conversations[userId].needsReply = false;
-      conversations[userId].lastReminderTime = 0;  // リマインダー情報をリセット
-      conversations[userId].reminderCount = 0;     // リマインダー情報をリセット
-      logDebug(`replyAndRecord: userId=${userId}, reply="${replyText}"`);
-    }
-  } catch (error) {
-    logDebug(`返信エラー: ${error.message}`);
-  }
-}
-
 // ---------------------------------------------------
-// 8) Web用返信済みマーク設定エンドポイント（新規追加）
+// 8) Web用返信済みマーク設定エンドポイント（このみを有効化）
 // ---------------------------------------------------
 app.get('/api/mark-as-replied-web', (req, res) => {
   const { userId } = req.query;
@@ -317,45 +285,7 @@ app.get('/api/mark-as-replied-web', (req, res) => {
 });
 
 // ---------------------------------------------------
-// 9) 手動操作用API（返信送信、返信済みマークなど）
-// ---------------------------------------------------
-app.post('/api/send-reply', express.json(), async (req, res) => {
-  const { userId, message } = req.body;
-  if (!userId || !message) {
-    return res.status(400).json({ success: false, error: 'userId と message は必須です' });
-  }
-  try {
-    await client.pushMessage(userId, { type: 'text', text: message });
-    const botMessageId = crypto.randomBytes(16).toString('hex');
-    if (conversations[userId]) {
-      conversations[userId].botReply = { text: message, timestamp: Date.now(), id: botMessageId };
-      conversations[userId].needsReply = false;
-      conversations[userId].lastReminderTime = 0;  // リマインダー情報をリセット
-      conversations[userId].reminderCount = 0;     // リマインダー情報をリセット
-    }
-    return res.json({ success: true, message: '送信成功', botMessageId });
-  } catch (error) {
-    logDebug(`push送信エラー: ${error.message}`);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.post('/api/mark-as-replied', express.json(), (req, res) => {
-  const { userId } = req.body;
-  if (!userId) {
-    return res.status(400).json({ success: false, error: 'userId は必須です' });
-  }
-  if (!conversations[userId]) {
-    return res.status(404).json({ success: false, message: '該当の会話が見つかりません' });
-  }
-  conversations[userId].needsReply = false;
-  conversations[userId].lastReminderTime = 0;  // リマインダー情報をリセット
-  conversations[userId].reminderCount = 0;     // リマインダー情報をリセット
-  return res.json({ success: true, message: '返信済みにしました' });
-});
-
-// ---------------------------------------------------
-// 10) 定期的な未返信チェック（15分ごと）
+// 9) 定期的な未返信チェック（15分ごと）
 // ---------------------------------------------------
 let isCheckingUnreplied = false;
 // 毎時00分、15分、30分、45分に実行するようにスケジュールを変更
@@ -427,7 +357,7 @@ cron.schedule('0,15,30,45 * * * *', async () => {
 });
 
 // ---------------------------------------------------
-// 11) 6時間ごとの古いデータクリーンアップ
+// 10) 6時間ごとの古いデータクリーンアップ
 // ---------------------------------------------------
 cron.schedule('0 */6 * * *', () => {
   logDebug('6時間ごとのクリーンアップ開始');
@@ -447,7 +377,7 @@ cron.schedule('0 */6 * * *', () => {
 });
 
 // ---------------------------------------------------
-// 12) デバッグ用エンドポイント
+// 11) デバッグ用エンドポイント
 // ---------------------------------------------------
 app.get('/api/conversations', (req, res) => {
   res.json({ success: true, conversations });
@@ -462,8 +392,158 @@ app.get('/ping', (req, res) => {
   res.status(200).send('pong');
 });
 
+// リマインダーの状態を診断するエンドポイント
+app.get('/api/debug-reminder', (req, res) => {
+  const now = Date.now();
+  const threeHoursMs = 3 * 60 * 60 * 1000;
+  const result = {
+    currentTime: new Date(now).toISOString(),
+    conversationStatus: [],
+    unrepliedMessages: []
+  };
+
+  // 全ての会話の状態を確認
+  for (const userId in conversations) {
+    const c = conversations[userId];
+    const status = {
+      userId,
+      displayName: c.displayName,
+      sourceType: c.sourceType,
+      needsReply: c.needsReply,
+      userMessageTime: c.userMessage ? new Date(c.userMessage.timestamp).toISOString() : null,
+      timeSinceMessage: c.userMessage ? now - c.userMessage.timestamp : null,
+      timeSinceMessageHours: c.userMessage ? ((now - c.userMessage.timestamp) / (60 * 60 * 1000)).toFixed(2) : null,
+      lastReminderTime: c.lastReminderTime ? new Date(c.lastReminderTime).toISOString() : null,
+      reminderCount: c.reminderCount || 0,
+      message: c.userMessage ? c.userMessage.text : null
+    };
+    
+    result.conversationStatus.push(status);
+
+    // 未返信でグループ以外のメッセージを収集
+    if (c.needsReply && c.userMessage && (c.sourceType !== 'group' && c.sourceType !== 'room')) {
+      const timeSinceMessage = now - c.userMessage.timestamp;
+      const timeSinceLastReminder = now - (c.lastReminderTime || 0);
+      
+      if ((timeSinceMessage >= threeHoursMs && !c.lastReminderTime) || 
+          (c.lastReminderTime && timeSinceLastReminder >= threeHoursMs)) {
+        result.unrepliedMessages.push({
+          userId,
+          displayName: c.displayName,
+          text: c.userMessage.text,
+          timestamp: new Date(c.userMessage.timestamp).toISOString(),
+          hoursSinceMessage: (timeSinceMessage / (60 * 60 * 1000)).toFixed(2),
+          lastReminderTime: c.lastReminderTime ? new Date(c.lastReminderTime).toISOString() : null,
+          hoursSinceLastReminder: c.lastReminderTime ? (timeSinceLastReminder / (60 * 60 * 1000)).toFixed(2) : null,
+          reminderCount: c.reminderCount || 0,
+          shouldSendReminder: 'YES'
+        });
+      } else {
+        let reason = '';
+        if (timeSinceMessage < threeHoursMs) {
+          reason = '3時間経過していません';
+        } else if (c.lastReminderTime && timeSinceLastReminder < threeHoursMs) {
+          reason = '前回のリマインドから3時間経過していません';
+        }
+        
+        result.unrepliedMessages.push({
+          userId,
+          displayName: c.displayName,
+          text: c.userMessage.text,
+          timestamp: new Date(c.userMessage.timestamp).toISOString(),
+          hoursSinceMessage: (timeSinceMessage / (60 * 60 * 1000)).toFixed(2),
+          lastReminderTime: c.lastReminderTime ? new Date(c.lastReminderTime).toISOString() : null,
+          hoursSinceLastReminder: c.lastReminderTime ? (timeSinceLastReminder / (60 * 60 * 1000)).toFixed(2) : null,
+          reminderCount: c.reminderCount || 0,
+          shouldSendReminder: 'NO',
+          reason
+        });
+      }
+    }
+  }
+
+  res.json(result);
+});
+
+// テストメッセージを作成するエンドポイント
+app.post('/api/create-test-conversation', (req, res) => {
+  const testUserId = 'U_TEST_USER_' + Date.now().toString().substring(8);
+  const testMessage = 'これはテストメッセージです - ' + new Date().toISOString();
+  
+  // 3時間前の時間を作成
+  const threeHoursAgo = Date.now() - (3 * 60 * 60 * 1000 + 5 * 60 * 1000); // 3時間5分前
+  
+  conversations[testUserId] = {
+    userMessage: { text: testMessage, timestamp: threeHoursAgo, id: 'test_msg_' + Date.now() },
+    botReply: null,
+    needsReply: true,
+    displayName: 'テストユーザー',
+    sourceType: 'user',
+    lastReminderTime: 0,
+    reminderCount: 0
+  };
+  
+  return res.json({ 
+    success: true, 
+    message: 'テスト会話を作成しました',
+    conversation: {
+      userId: testUserId,
+      displayName: 'テストユーザー',
+      text: testMessage,
+      timestamp: new Date(threeHoursAgo).toISOString(),
+      needsReply: true
+    },
+    note: '次回のリマインダーチェック（15分ごと）で通知が送信されるはずです'
+  });
+});
+
+// 強制的にリマインドを送信するエンドポイント
+app.post('/api/force-remind', express.json(), async (req, res) => {
+  const { userId } = req.body;
+  
+  if (!userId) {
+    return res.status(400).json({ success: false, error: 'userId は必須です' });
+  }
+  
+  if (!conversations[userId]) {
+    return res.status(404).json({ success: false, error: '該当の会話が見つかりません' });
+  }
+  
+  try {
+    const c = conversations[userId];
+    if (!c.needsReply || !c.userMessage) {
+      return res.status(400).json({ success: false, error: '未返信のメッセージがないか、返信不要の状態です' });
+    }
+    
+    const now = Date.now();
+    const reminderCount = (c.reminderCount || 0) + 1;
+    const customText = `【強制送信】${c.displayName}さんからのメッセージ「${c.userMessage.text}」への返信が必要です。`;
+    
+    await sendSlackInteractiveNotification(userId, customText, true, reminderCount);
+    
+    // リマインダー情報を更新
+    conversations[userId].lastReminderTime = now;
+    conversations[userId].reminderCount = reminderCount;
+    
+    return res.json({ 
+      success: true, 
+      message: 'リマインダーを強制送信しました',
+      conversation: {
+        userId,
+        displayName: c.displayName,
+        text: c.userMessage.text,
+        timestamp: new Date(c.userMessage.timestamp).toISOString(),
+        lastReminderTime: new Date(now).toISOString(),
+        reminderCount
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // ---------------------------------------------------
-// 13) サーバー起動
+// 12) サーバー起動
 // ---------------------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
