@@ -44,7 +44,8 @@ const client = new line.Client(config);
 //    displayName: string,
 //    sourceType: string,
 //    lastReminderTime: number, // 最後にリマインダーを送信した時間
-//    reminderCount: number     // リマインダーの送信回数
+//    reminderCount: number,    // リマインダーの送信回数
+//    securityToken: string     // セキュリティトークン
 // } }
 const conversations = {};
 
@@ -61,24 +62,38 @@ function logDebug(message) {
 }
 
 // ---------------------------------------------------
-// 4) ミドルウェア設定
+// 4) セキュリティトークン生成
+// ---------------------------------------------------
+function generateSecurityToken() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+// ---------------------------------------------------
+// 5) ミドルウェア設定
 // ---------------------------------------------------
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ---------------------------------------------------
-// 5) Slack通知用のヘルパー
+// 6) Slack通知用のヘルパー
 // ---------------------------------------------------
 
 // (A) 直接テキストメッセージとリンクを作成
 function createSlackMessage(lineUserId, customText, isReminder = false, reminderCount = 0) {
-  const markAsRepliedUrl = `${APP_BASE_URL}/api/mark-as-replied-web?userId=${lineUserId}`;
+  const securityToken = conversations[lineUserId].securityToken || generateSecurityToken();
+  
+  // トークンを保存
+  if (conversations[lineUserId]) {
+    conversations[lineUserId].securityToken = securityToken;
+  }
+  
+  const markAsRepliedUrl = `${APP_BASE_URL}/api/mark-as-replied-confirm?userId=${lineUserId}&token=${securityToken}`;
   
   let prefix = isReminder ? `*【リマインダー ${reminderCount > 0 ? `#${reminderCount}` : ''}】*\n` : '*【LINEからの新着メッセージ】*\n';
   
   return {
-    text: `${prefix}${customText}\n\n<${markAsRepliedUrl}|👉 返信済みにする>`,
+    text: `${prefix}${customText}\n\n返信済みにするには以下のリンクをクリックしてください:\n${markAsRepliedUrl}`,
     unfurl_links: false
   };
 }
@@ -115,7 +130,7 @@ async function sendSlackNotification(message) {
 }
 
 // ---------------------------------------------------
-// 6) LINE Bot 用Webhookエンドポイント
+// 7) LINE Bot 用Webhookエンドポイント
 // ---------------------------------------------------
 app.post('/webhook', (req, res) => {
   const signature = req.headers['x-line-signature'];
@@ -149,7 +164,7 @@ app.post('/webhook', (req, res) => {
 });
 
 // ---------------------------------------------------
-// 7) LINEイベントハンドラー
+// 8) LINEイベントハンドラー
 // ---------------------------------------------------
 async function handleLineEvent(event) {
   logDebug(`イベント処理開始: type=${event.type}, webhookEventId=${event.webhookEventId || 'なし'}`);
@@ -215,6 +230,9 @@ async function handleLineEvent(event) {
   // 通常のメッセージの場合、会話状態を更新し新着メッセージ用のSlack通知を送信
   // グループメッセージは上で既にフィルターされているので、ここでの sourceType チェックは不要
   if (isFromUser) {
+    // セキュリティトークンを生成
+    const securityToken = generateSecurityToken();
+    
     if (!conversations[userId]) {
       conversations[userId] = {
         userMessage: { text: messageText, timestamp, id: messageId },
@@ -223,7 +241,8 @@ async function handleLineEvent(event) {
         displayName,
         sourceType,
         lastReminderTime: 0,     // 最後にリマインダーを送信した時間（初期値：0）
-        reminderCount: 0         // リマインダーの送信回数（初期値：0）
+        reminderCount: 0,        // リマインダーの送信回数（初期値：0）
+        securityToken            // セキュリティトークン
       };
       logDebug(`新規会話作成: userId=${userId}, text="${messageText}"`);
     } else {
@@ -231,6 +250,7 @@ async function handleLineEvent(event) {
       conversations[userId].needsReply = true;
       conversations[userId].lastReminderTime = 0; // 新しいメッセージでリセット
       conversations[userId].reminderCount = 0;    // 新しいメッセージでリセット
+      conversations[userId].securityToken = securityToken; // セキュリティトークン更新
       logDebug(`既存会話更新: userId=${userId}, text="${messageText}"`);
     }
     // 新着メッセージ用のインタラクティブ通知（即時送信）
@@ -240,16 +260,79 @@ async function handleLineEvent(event) {
 }
 
 // ---------------------------------------------------
-// 8) Web用返信済みマーク設定エンドポイント（このみを有効化）
+// 9) 確認ページ表示エンドポイント（新設）
 // ---------------------------------------------------
-app.get('/api/mark-as-replied-web', (req, res) => {
-  const { userId } = req.query;
-  if (!userId) {
-    return res.send('エラー: ユーザーIDが指定されていません');
+app.get('/api/mark-as-replied-confirm', (req, res) => {
+  const { userId, token } = req.query;
+  if (!userId || !token) {
+    return res.send('エラー: 必須パラメータが不足しています');
   }
   
   if (!conversations[userId]) {
     return res.send('エラー: 該当のユーザーが見つかりません');
+  }
+  
+  // トークン検証
+  if (conversations[userId].securityToken !== token) {
+    logDebug(`トークン不一致: userId=${userId}, expected=${conversations[userId].securityToken}, received=${token}`);
+    return res.send('エラー: セキュリティトークンが無効です');
+  }
+  
+  const displayName = conversations[userId].displayName || 'Unknown User';
+  const messageText = conversations[userId].userMessage ? conversations[userId].userMessage.text : '';
+  
+  // 確認ページをレンダリング
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>返信済み確認</title>
+      <style>
+        body { font-family: sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; text-align: center; }
+        .message { margin: 20px 0; padding: 15px; background: #f5f5f5; border-radius: 8px; }
+        .confirm { margin: 30px 0; }
+        .btn { display: inline-block; padding: 10px 20px; background: #4CAF50; color: white; text-decoration: none; border-radius: 4px; font-weight: bold; }
+        .btn:hover { background: #45a049; }
+        .back { margin-top: 20px; color: #666; }
+      </style>
+    </head>
+    <body>
+      <h2>返信済みにする確認</h2>
+      <p>以下のメッセージを返信済みにしますか？</p>
+      <div class="message">
+        <p><strong>ユーザー:</strong> ${displayName}</p>
+        <p><strong>メッセージ:</strong> ${messageText}</p>
+      </div>
+      <div class="confirm">
+        <a href="/api/mark-as-replied-web?userId=${userId}&token=${token}" class="btn">はい、返信済みにする</a>
+      </div>
+      <div class="back">
+        <a href="javascript:window.close()">キャンセル</a>
+      </div>
+    </body>
+    </html>
+  `);
+});
+
+// ---------------------------------------------------
+// 10) Web用返信済みマーク設定エンドポイント（トークン検証付き）
+// ---------------------------------------------------
+app.get('/api/mark-as-replied-web', (req, res) => {
+  const { userId, token } = req.query;
+  if (!userId || !token) {
+    return res.send('エラー: 必須パラメータが不足しています');
+  }
+  
+  if (!conversations[userId]) {
+    return res.send('エラー: 該当のユーザーが見つかりません');
+  }
+  
+  // トークン検証
+  if (conversations[userId].securityToken !== token) {
+    logDebug(`トークン不一致: userId=${userId}, expected=${conversations[userId].securityToken}, received=${token}`);
+    return res.send('エラー: セキュリティトークンが無効です');
   }
   
   try {
@@ -285,7 +368,7 @@ app.get('/api/mark-as-replied-web', (req, res) => {
 });
 
 // ---------------------------------------------------
-// 9) 定期的な未返信チェック（15分ごと）
+// 11) 定期的な未返信チェック（15分ごと）
 // ---------------------------------------------------
 let isCheckingUnreplied = false;
 // 毎時00分、15分、30分、45分に実行するようにスケジュールを変更
@@ -357,7 +440,7 @@ cron.schedule('0,15,30,45 * * * *', async () => {
 });
 
 // ---------------------------------------------------
-// 10) 6時間ごとの古いデータクリーンアップ
+// 12) 6時間ごとの古いデータクリーンアップ
 // ---------------------------------------------------
 cron.schedule('0 */6 * * *', () => {
   logDebug('6時間ごとのクリーンアップ開始');
@@ -377,7 +460,7 @@ cron.schedule('0 */6 * * *', () => {
 });
 
 // ---------------------------------------------------
-// 11) デバッグ用エンドポイント
+// 13) デバッグ用エンドポイント
 // ---------------------------------------------------
 app.get('/api/conversations', (req, res) => {
   res.json({ success: true, conversations });
@@ -415,7 +498,8 @@ app.get('/api/debug-reminder', (req, res) => {
       timeSinceMessageHours: c.userMessage ? ((now - c.userMessage.timestamp) / (60 * 60 * 1000)).toFixed(2) : null,
       lastReminderTime: c.lastReminderTime ? new Date(c.lastReminderTime).toISOString() : null,
       reminderCount: c.reminderCount || 0,
-      message: c.userMessage ? c.userMessage.text : null
+      message: c.userMessage ? c.userMessage.text : null,
+      securityToken: c.securityToken ? '**********' + c.securityToken.substring(c.securityToken.length - 4) : null
     };
     
     result.conversationStatus.push(status);
@@ -473,6 +557,9 @@ app.post('/api/create-test-conversation', (req, res) => {
   // 3時間前の時間を作成
   const threeHoursAgo = Date.now() - (3 * 60 * 60 * 1000 + 5 * 60 * 1000); // 3時間5分前
   
+  // セキュリティトークンを生成
+  const securityToken = generateSecurityToken();
+  
   conversations[testUserId] = {
     userMessage: { text: testMessage, timestamp: threeHoursAgo, id: 'test_msg_' + Date.now() },
     botReply: null,
@@ -480,7 +567,8 @@ app.post('/api/create-test-conversation', (req, res) => {
     displayName: 'テストユーザー',
     sourceType: 'user',
     lastReminderTime: 0,
-    reminderCount: 0
+    reminderCount: 0,
+    securityToken
   };
   
   return res.json({ 
@@ -491,7 +579,8 @@ app.post('/api/create-test-conversation', (req, res) => {
       displayName: 'テストユーザー',
       text: testMessage,
       timestamp: new Date(threeHoursAgo).toISOString(),
-      needsReply: true
+      needsReply: true,
+      securityToken: securityToken
     },
     note: '次回のリマインダーチェック（15分ごと）で通知が送信されるはずです'
   });
@@ -543,7 +632,7 @@ app.post('/api/force-remind', express.json(), async (req, res) => {
 });
 
 // ---------------------------------------------------
-// 12) サーバー起動
+// 14) サーバー起動
 // ---------------------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
