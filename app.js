@@ -9,15 +9,67 @@ const app = express();
 // ---------------------------------------------------
 // 1) LINE/Slackの設定＆初期化
 // ---------------------------------------------------
-const config = {
-  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
-  channelSecret: process.env.LINE_CHANNEL_SECRET
-};
+function initializeLineChannels() {
+  const channels = [];
+  const rawConfigs = process.env.LINE_CHANNEL_CONFIGS;
 
-if (!config.channelAccessToken || !config.channelSecret) {
-  console.error('エラー: LINE_CHANNEL_ACCESS_TOKEN または LINE_CHANNEL_SECRET が設定されていません');
-  process.exit(1);
+  if (rawConfigs) {
+    try {
+      const parsed = JSON.parse(rawConfigs);
+      if (!Array.isArray(parsed)) {
+        throw new Error('配列ではありません');
+      }
+
+      parsed.forEach((entry, index) => {
+        if (!entry || !entry.channelAccessToken || !entry.channelSecret) {
+          throw new Error(`index=${index} の設定に channelAccessToken または channelSecret がありません`);
+        }
+
+        const channelId = entry.id || entry.channelId || entry.destination || `channel-${index + 1}`;
+        const channelLabel = entry.label || entry.name || channelId;
+        channels.push({
+          id: channelId,
+          label: channelLabel,
+          channelSecret: entry.channelSecret,
+          destination: entry.destination || entry.botUserId || null,
+          client: new line.Client({ channelAccessToken: entry.channelAccessToken })
+        });
+      });
+
+      if (channels.length === 0) {
+        throw new Error('有効なLINEチャンネル設定が見つかりませんでした');
+      }
+    } catch (error) {
+      console.error('エラー: LINE_CHANNEL_CONFIGS の解析に失敗しました:', error.message);
+      process.exit(1);
+    }
+  }
+
+  if (channels.length === 0) {
+    const channelAccessToken = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+    const channelSecret = process.env.LINE_CHANNEL_SECRET;
+
+    if (!channelAccessToken || !channelSecret) {
+      console.error('エラー: LINE_CHANNEL_ACCESS_TOKEN または LINE_CHANNEL_SECRET が設定されていません');
+      process.exit(1);
+    }
+
+    const channelId = process.env.LINE_PRIMARY_CHANNEL_ID || 'default';
+    const channelLabel = process.env.LINE_CHANNEL_LABEL || process.env.LINE_CHANNEL_NAME || channelId;
+
+    channels.push({
+      id: channelId,
+      label: channelLabel,
+      channelSecret,
+      destination: process.env.LINE_DESTINATION_ID || null,
+      client: new line.Client({ channelAccessToken })
+    });
+  }
+
+  return channels;
 }
+
+const lineChannels = initializeLineChannels();
 
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
 if (!SLACK_WEBHOOK_URL) {
@@ -27,17 +79,20 @@ if (!SLACK_WEBHOOK_URL) {
 const APP_BASE_URL = process.env.APP_BASE_URL || 'https://line-reminder-bot-de113f80aa92.herokuapp.com';
 
 console.log('環境変数の状態:');
-console.log('LINE_CHANNEL_ACCESS_TOKEN exists:', !!config.channelAccessToken);
-console.log('LINE_CHANNEL_SECRET exists:', !!config.channelSecret);
+console.log('LINE_CHANNEL_CONFIGS exists:', !!process.env.LINE_CHANNEL_CONFIGS);
+console.log('LINE_CHANNEL_ACCESS_TOKEN exists:', !!process.env.LINE_CHANNEL_ACCESS_TOKEN);
+console.log('LINE_CHANNEL_SECRET exists:', !!process.env.LINE_CHANNEL_SECRET);
 console.log('SLACK_WEBHOOK_URL exists:', !!SLACK_WEBHOOK_URL);
 console.log('APP_BASE_URL:', APP_BASE_URL);
-
-const client = new line.Client(config);
+console.log('登録済みLINEチャンネル:', lineChannels.map(channel => `${channel.id} (${channel.label})`));
 
 // ---------------------------------------------------
 // 2) 会話状態管理
 // ---------------------------------------------------
-// { userId: {
+// { "<channelId>:<userId>": {
+//    channelId: string,
+//    channelLabel: string,
+//    lineUserId: string,
 //    userMessage: { text, timestamp, id },
 //    botReply: { text, timestamp, id },
 //    needsReply: boolean,
@@ -48,6 +103,10 @@ const client = new line.Client(config);
 //    securityToken: string     // セキュリティトークン
 // } }
 const conversations = {};
+
+function getConversationKey(channelId, userId) {
+  return `${channelId}:${userId}`;
+}
 
 // ---------------------------------------------------
 // 3) デバッグログ管理
@@ -80,33 +139,50 @@ app.use(express.urlencoded({ extended: true }));
 // ---------------------------------------------------
 
 // (A) 直接テキストメッセージとリンクを作成
-function createSlackMessage(lineUserId, customText, isReminder = false, reminderCount = 0) {
-  const securityToken = conversations[lineUserId].securityToken || generateSecurityToken();
-  
-  // トークンを保存
-  if (conversations[lineUserId]) {
-    conversations[lineUserId].securityToken = securityToken;
+function createSlackMessage(conversationKey, customText, isReminder = false, reminderCount = 0) {
+  const conversation = conversations[conversationKey];
+  if (!conversation) {
+    throw new Error(`conversation not found for key=${conversationKey}`);
   }
-  
-  const markAsRepliedUrl = `${APP_BASE_URL}/api/mark-as-replied-confirm?userId=${lineUserId}&token=${securityToken}`;
-  
-  let prefix = isReminder ? `*【リマインダー ${reminderCount > 0 ? `#${reminderCount}` : ''}】*\n` : '*【LINEからの新着メッセージ】*\n';
-  
+
+  const securityToken = conversation.securityToken || generateSecurityToken();
+  conversation.securityToken = securityToken;
+
+  const markAsRepliedUrl = `${APP_BASE_URL}/api/mark-as-replied-confirm?channelId=${encodeURIComponent(conversation.channelId)}&userId=${encodeURIComponent(conversation.lineUserId)}&token=${encodeURIComponent(securityToken)}`;
+
+  const titleParts = [];
+  if (conversation.channelLabel) {
+    titleParts.push(conversation.channelLabel);
+  }
+  if (isReminder) {
+    titleParts.push(`リマインダー${reminderCount > 0 ? ` #${reminderCount}` : ''}`.trim());
+  } else {
+    titleParts.push('LINEからの新着メッセージ');
+  }
+
+  const prefix = `*【${titleParts.join(' / ')}】*`;
+
   return {
-    text: `${prefix}${customText}\n\n返信済みにするには以下のリンクをクリックしてください:\n${markAsRepliedUrl}`,
+    text: `${prefix}\n${customText}\n\n返信済みにするには以下のリンクをクリックしてください:\n${markAsRepliedUrl}`,
     unfurl_links: false
   };
 }
 
 // (B) インタラクティブ通知を送る（修正版）
-async function sendSlackInteractiveNotification(lineUserId, customText, isReminder = false, reminderCount = 0) {
+async function sendSlackInteractiveNotification(conversationKey, customText, isReminder = false, reminderCount = 0) {
   if (!SLACK_WEBHOOK_URL) {
     logDebug('Slack Webhook URLが未設定のため送信できません');
     return;
   }
-  
-  const message = createSlackMessage(lineUserId, customText, isReminder, reminderCount);
-  
+
+  let message;
+  try {
+    message = createSlackMessage(conversationKey, customText, isReminder, reminderCount);
+  } catch (error) {
+    logDebug(`Slack通知用メッセージ作成に失敗: conversationKey=${conversationKey}, error=${error.message}`);
+    return;
+  }
+
   try {
     const response = await axios.post(SLACK_WEBHOOK_URL, message);
     logDebug(`Slack通知送信成功: ${response.status}`);
@@ -139,15 +215,25 @@ app.post('/webhook', (req, res) => {
     return res.status(400).send('署名がありません');
   }
 
-  const channelSecret = config.channelSecret;
-  const hmac = crypto.createHmac('SHA256', channelSecret);
-  const bodyStr = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
-  const digestFromBody = hmac.update(bodyStr).digest('base64');
+  const bodyBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
 
-  if (digestFromBody !== signature) {
-    logDebug(`署名不一致: Expected=${digestFromBody}, Received=${signature}`);
+  let matchedChannel = null;
+
+  for (const channel of lineChannels) {
+    const hmac = crypto.createHmac('SHA256', channel.channelSecret);
+    const digest = hmac.update(bodyBuffer).digest('base64');
+    if (digest === signature) {
+      matchedChannel = channel;
+      break;
+    }
+  }
+
+  if (!matchedChannel) {
+    logDebug(`署名不一致: Received=${signature}`);
     return res.status(400).send('署名が一致しません');
   }
+
+  logDebug(`署名検証成功: channelId=${matchedChannel.id}`);
 
   const parsedBody = Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString()) : req.body;
   if (!parsedBody || !parsedBody.events || !Array.isArray(parsedBody.events)) {
@@ -157,7 +243,7 @@ app.post('/webhook', (req, res) => {
 
   res.status(200).end(); // 先に200を返す
 
-  Promise.all(parsedBody.events.map(handleLineEvent))
+  Promise.all(parsedBody.events.map(event => handleLineEvent(event, matchedChannel)))
     .catch(err => {
       console.error('イベント処理エラー:', err);
     });
@@ -166,18 +252,20 @@ app.post('/webhook', (req, res) => {
 // ---------------------------------------------------
 // 8) LINEイベントハンドラー
 // ---------------------------------------------------
-async function handleLineEvent(event) {
-  logDebug(`イベント処理開始: type=${event.type}, webhookEventId=${event.webhookEventId || 'なし'}`);
+async function handleLineEvent(event, lineChannel) {
+  logDebug(`イベント処理開始: channelId=${lineChannel.id}, type=${event.type}, webhookEventId=${event.webhookEventId || 'なし'}`);
   if (event.type !== 'message' || event.message.type !== 'text') return;
 
+  const client = lineChannel.client;
   const userId = event.source.userId;
   const messageText = event.message.text;
   const messageId = event.message.id;
   const timestamp = event.timestamp;
   const isFromUser = !!event.replyToken;
   const sourceType = event.source.type;
+  const conversationKey = getConversationKey(lineChannel.id, userId);
 
-  logDebug(`受信: userId=${userId}, sourceType=${sourceType}, text="${messageText}", isFromUser=${isFromUser}`);
+  logDebug(`受信: channelId=${lineChannel.id}, userId=${userId}, sourceType=${sourceType}, text="${messageText}", isFromUser=${isFromUser}`);
 
   // グループからのメッセージは無視する（特定のコマンドは処理）
   if (sourceType === 'group' || sourceType === 'room') {
@@ -211,7 +299,7 @@ async function handleLineEvent(event) {
   // 特殊コマンド判定
   if (isFromUser) {
     if (['ステータス', 'status'].includes(messageText)) {
-      const c = conversations[userId];
+      const c = conversations[conversationKey];
       let statusMessage = c && c.needsReply
         ? `未返信です。\n最後のメッセージ: "${c.userMessage.text}"\n時間: ${new Date(c.userMessage.timestamp).toLocaleString('ja-JP')}`
         : '返信済みです。';
@@ -232,9 +320,12 @@ async function handleLineEvent(event) {
   if (isFromUser) {
     // セキュリティトークンを生成
     const securityToken = generateSecurityToken();
-    
-    if (!conversations[userId]) {
-      conversations[userId] = {
+
+    if (!conversations[conversationKey]) {
+      conversations[conversationKey] = {
+        channelId: lineChannel.id,
+        channelLabel: lineChannel.label,
+        lineUserId: userId,
         userMessage: { text: messageText, timestamp, id: messageId },
         botReply: null,
         needsReply: true,
@@ -244,18 +335,19 @@ async function handleLineEvent(event) {
         reminderCount: 0,        // リマインダーの送信回数（初期値：0）
         securityToken            // セキュリティトークン
       };
-      logDebug(`新規会話作成: userId=${userId}, text="${messageText}"`);
+      logDebug(`新規会話作成: channelId=${lineChannel.id}, userId=${userId}, text="${messageText}"`);
     } else {
-      conversations[userId].userMessage = { text: messageText, timestamp, id: messageId };
-      conversations[userId].needsReply = true;
-      conversations[userId].lastReminderTime = 0; // 新しいメッセージでリセット
-      conversations[userId].reminderCount = 0;    // 新しいメッセージでリセット
-      conversations[userId].securityToken = securityToken; // セキュリティトークン更新
-      logDebug(`既存会話更新: userId=${userId}, text="${messageText}"`);
+      conversations[conversationKey].userMessage = { text: messageText, timestamp, id: messageId };
+      conversations[conversationKey].needsReply = true;
+      conversations[conversationKey].lastReminderTime = 0; // 新しいメッセージでリセット
+      conversations[conversationKey].reminderCount = 0;    // 新しいメッセージでリセット
+      conversations[conversationKey].securityToken = securityToken; // セキュリティトークン更新
+      conversations[conversationKey].channelLabel = lineChannel.label;
+      logDebug(`既存会話更新: channelId=${lineChannel.id}, userId=${userId}, text="${messageText}"`);
     }
     // 新着メッセージ用のインタラクティブ通知（即時送信）
     const customText = `【${displayName}】からのメッセージ：「${messageText}」`;
-    await sendSlackInteractiveNotification(userId, customText);
+    await sendSlackInteractiveNotification(conversationKey, customText);
   }
 }
 
@@ -263,24 +355,35 @@ async function handleLineEvent(event) {
 // 9) 確認ページ表示エンドポイント（新設）
 // ---------------------------------------------------
 app.get('/api/mark-as-replied-confirm', (req, res) => {
-  const { userId, token } = req.query;
+  let { userId, token, channelId } = req.query;
   if (!userId || !token) {
     return res.send('エラー: 必須パラメータが不足しています');
   }
-  
-  if (!conversations[userId]) {
+
+  if (!channelId) {
+    if (lineChannels.length === 1) {
+      channelId = lineChannels[0].id;
+    } else {
+      return res.send('エラー: channelId が必要です');
+    }
+  }
+
+  const conversationKey = getConversationKey(channelId, userId);
+  const conversation = conversations[conversationKey];
+
+  if (!conversation) {
     return res.send('エラー: 該当のユーザーが見つかりません');
   }
-  
+
   // トークン検証
-  if (conversations[userId].securityToken !== token) {
-    logDebug(`トークン不一致: userId=${userId}, expected=${conversations[userId].securityToken}, received=${token}`);
+  if (conversation.securityToken !== token) {
+    logDebug(`トークン不一致: channelId=${channelId}, userId=${userId}, expected=${conversation.securityToken}, received=${token}`);
     return res.send('エラー: セキュリティトークンが無効です');
   }
-  
-  const displayName = conversations[userId].displayName || 'Unknown User';
-  const messageText = conversations[userId].userMessage ? conversations[userId].userMessage.text : '';
-  
+
+  const displayName = conversation.displayName || 'Unknown User';
+  const messageText = conversation.userMessage ? conversation.userMessage.text : '';
+
   // 確認ページをレンダリング
   res.send(`
     <!DOCTYPE html>
@@ -303,10 +406,11 @@ app.get('/api/mark-as-replied-confirm', (req, res) => {
       <p>以下のメッセージを返信済みにしますか？</p>
       <div class="message">
         <p><strong>ユーザー:</strong> ${displayName}</p>
+        ${conversation.channelLabel ? `<p><strong>受信先アカウント:</strong> ${conversation.channelLabel}</p>` : ''}
         <p><strong>メッセージ:</strong> ${messageText}</p>
       </div>
       <div class="confirm">
-        <a href="/api/mark-as-replied-web?userId=${userId}&token=${token}" class="btn">はい、返信済みにする</a>
+        <a href="/api/mark-as-replied-web?channelId=${encodeURIComponent(channelId)}&userId=${encodeURIComponent(userId)}&token=${encodeURIComponent(token)}" class="btn">はい、返信済みにする</a>
       </div>
       <div class="back">
         <a href="javascript:window.close()">キャンセル</a>
@@ -320,27 +424,38 @@ app.get('/api/mark-as-replied-confirm', (req, res) => {
 // 10) Web用返信済みマーク設定エンドポイント（トークン検証付き）
 // ---------------------------------------------------
 app.get('/api/mark-as-replied-web', (req, res) => {
-  const { userId, token } = req.query;
+  let { userId, token, channelId } = req.query;
   if (!userId || !token) {
     return res.send('エラー: 必須パラメータが不足しています');
   }
-  
-  if (!conversations[userId]) {
+
+  if (!channelId) {
+    if (lineChannels.length === 1) {
+      channelId = lineChannels[0].id;
+    } else {
+      return res.send('エラー: channelId が必要です');
+    }
+  }
+
+  const conversationKey = getConversationKey(channelId, userId);
+  const conversation = conversations[conversationKey];
+
+  if (!conversation) {
     return res.send('エラー: 該当のユーザーが見つかりません');
   }
-  
+
   // トークン検証
-  if (conversations[userId].securityToken !== token) {
-    logDebug(`トークン不一致: userId=${userId}, expected=${conversations[userId].securityToken}, received=${token}`);
+  if (conversation.securityToken !== token) {
+    logDebug(`トークン不一致: channelId=${channelId}, userId=${userId}, expected=${conversation.securityToken}, received=${token}`);
     return res.send('エラー: セキュリティトークンが無効です');
   }
-  
+
   try {
-    conversations[userId].needsReply = false;
-    conversations[userId].lastReminderTime = 0;  // リマインダー情報をリセット
-    conversations[userId].reminderCount = 0;     // リマインダー情報をリセット
-    logDebug(`会話更新（Web経由）: userId=${userId} を返信済みに設定`);
-    
+    conversation.needsReply = false;
+    conversation.lastReminderTime = 0;  // リマインダー情報をリセット
+    conversation.reminderCount = 0;     // リマインダー情報をリセット
+    logDebug(`会話更新（Web経由）: channelId=${channelId}, userId=${userId} を返信済みに設定`);
+
     // 成功ページをレンダリング
     res.send(`
       <!DOCTYPE html>
@@ -386,19 +501,22 @@ cron.schedule('0,15,30,45 * * * *', async () => {
     const threeHoursMs = 3 * 60 * 60 * 1000;
     const unreplied = [];
 
-    for (const userId in conversations) {
-      const c = conversations[userId];
+    for (const conversationKey in conversations) {
+      const c = conversations[conversationKey];
       // グループメッセージは未返信リマインダーから除外
       if (c.needsReply && c.userMessage && (c.sourceType !== 'group' && c.sourceType !== 'room')) {
         const timeSinceMessage = now - c.userMessage.timestamp;
         const timeSinceLastReminder = now - (c.lastReminderTime || 0);
-        
+
         // 初回のリマインダー（3時間以上経過している、かつリマインダー未送信）
         // または、直近のリマインダーから3時間以上経過している場合
-        if ((timeSinceMessage >= threeHoursMs && !c.lastReminderTime) || 
+        if ((timeSinceMessage >= threeHoursMs && !c.lastReminderTime) ||
             (c.lastReminderTime && timeSinceLastReminder >= threeHoursMs)) {
           unreplied.push({
-            userId,
+            conversationKey,
+            channelId: c.channelId,
+            channelLabel: c.channelLabel,
+            lineUserId: c.lineUserId,
             displayName: c.displayName,
             text: c.userMessage.text,
             timestamp: c.userMessage.timestamp,
@@ -422,14 +540,14 @@ cron.schedule('0,15,30,45 * * * *', async () => {
         : `${minutesTotal}分`;
         
       const customText = `${entry.displayName}さんからのメッセージ「${entry.text}」に${elapsedTimeText}返信がありません。`;
-      logDebug(`リマインダー#${entry.reminderCount}送信: userId=${entry.userId}, message="${entry.text}", 経過時間=${elapsedTimeText}`);
-      
-      await sendSlackInteractiveNotification(entry.userId, customText, true, entry.reminderCount);
-      
+      logDebug(`リマインダー#${entry.reminderCount}送信: channelId=${entry.channelId}, userId=${entry.lineUserId}, message="${entry.text}", 経過時間=${elapsedTimeText}`);
+
+      await sendSlackInteractiveNotification(entry.conversationKey, customText, true, entry.reminderCount);
+
       // リマインダー情報を更新
-      if (conversations[entry.userId]) {
-        conversations[entry.userId].lastReminderTime = now;
-        conversations[entry.userId].reminderCount = entry.reminderCount;
+      if (conversations[entry.conversationKey]) {
+        conversations[entry.conversationKey].lastReminderTime = now;
+        conversations[entry.conversationKey].reminderCount = entry.reminderCount;
       }
     }
   } catch (error) {
@@ -448,10 +566,10 @@ cron.schedule('0 */6 * * *', () => {
   const oneDayMs = 24 * 60 * 60 * 1000;
   let cleaned = 0;
 
-  for (const userId in conversations) {
-    const c = conversations[userId];
+  for (const conversationKey in conversations) {
+    const c = conversations[conversationKey];
     if (!c.needsReply && c.userMessage && (now - c.userMessage.timestamp > oneDayMs)) {
-      delete conversations[userId];
+      delete conversations[conversationKey];
       cleaned++;
     }
   }
@@ -486,10 +604,13 @@ app.get('/api/debug-reminder', (req, res) => {
   };
 
   // 全ての会話の状態を確認
-  for (const userId in conversations) {
-    const c = conversations[userId];
+  for (const conversationKey in conversations) {
+    const c = conversations[conversationKey];
     const status = {
-      userId,
+      conversationKey,
+      channelId: c.channelId,
+      channelLabel: c.channelLabel,
+      userId: c.lineUserId,
       displayName: c.displayName,
       sourceType: c.sourceType,
       needsReply: c.needsReply,
@@ -508,11 +629,14 @@ app.get('/api/debug-reminder', (req, res) => {
     if (c.needsReply && c.userMessage && (c.sourceType !== 'group' && c.sourceType !== 'room')) {
       const timeSinceMessage = now - c.userMessage.timestamp;
       const timeSinceLastReminder = now - (c.lastReminderTime || 0);
-      
-      if ((timeSinceMessage >= threeHoursMs && !c.lastReminderTime) || 
+
+      if ((timeSinceMessage >= threeHoursMs && !c.lastReminderTime) ||
           (c.lastReminderTime && timeSinceLastReminder >= threeHoursMs)) {
         result.unrepliedMessages.push({
-          userId,
+          conversationKey,
+          channelId: c.channelId,
+          channelLabel: c.channelLabel,
+          userId: c.lineUserId,
           displayName: c.displayName,
           text: c.userMessage.text,
           timestamp: new Date(c.userMessage.timestamp).toISOString(),
@@ -529,9 +653,12 @@ app.get('/api/debug-reminder', (req, res) => {
         } else if (c.lastReminderTime && timeSinceLastReminder < threeHoursMs) {
           reason = '前回のリマインドから3時間経過していません';
         }
-        
+
         result.unrepliedMessages.push({
-          userId,
+          conversationKey,
+          channelId: c.channelId,
+          channelLabel: c.channelLabel,
+          userId: c.lineUserId,
           displayName: c.displayName,
           text: c.userMessage.text,
           timestamp: new Date(c.userMessage.timestamp).toISOString(),
@@ -551,16 +678,25 @@ app.get('/api/debug-reminder', (req, res) => {
 
 // テストメッセージを作成するエンドポイント
 app.post('/api/create-test-conversation', (req, res) => {
+  if (lineChannels.length === 0) {
+    return res.status(500).json({ success: false, error: 'LINEチャンネルが構成されていません' });
+  }
+
+  const targetChannel = lineChannels[0];
   const testUserId = 'U_TEST_USER_' + Date.now().toString().substring(8);
   const testMessage = 'これはテストメッセージです - ' + new Date().toISOString();
-  
+
   // 3時間前の時間を作成
   const threeHoursAgo = Date.now() - (3 * 60 * 60 * 1000 + 5 * 60 * 1000); // 3時間5分前
-  
+
   // セキュリティトークンを生成
   const securityToken = generateSecurityToken();
-  
-  conversations[testUserId] = {
+  const conversationKey = getConversationKey(targetChannel.id, testUserId);
+
+  conversations[conversationKey] = {
+    channelId: targetChannel.id,
+    channelLabel: targetChannel.label,
+    lineUserId: testUserId,
     userMessage: { text: testMessage, timestamp: threeHoursAgo, id: 'test_msg_' + Date.now() },
     botReply: null,
     needsReply: true,
@@ -570,17 +706,20 @@ app.post('/api/create-test-conversation', (req, res) => {
     reminderCount: 0,
     securityToken
   };
-  
-  return res.json({ 
-    success: true, 
+
+  return res.json({
+    success: true,
     message: 'テスト会話を作成しました',
     conversation: {
+      conversationKey,
+      channelId: targetChannel.id,
+      channelLabel: targetChannel.label,
       userId: testUserId,
       displayName: 'テストユーザー',
       text: testMessage,
       timestamp: new Date(threeHoursAgo).toISOString(),
       needsReply: true,
-      securityToken: securityToken
+      securityToken
     },
     note: '次回のリマインダーチェック（15分ごと）で通知が送信されるはずです'
   });
@@ -588,40 +727,53 @@ app.post('/api/create-test-conversation', (req, res) => {
 
 // 強制的にリマインドを送信するエンドポイント
 app.post('/api/force-remind', express.json(), async (req, res) => {
-  const { userId } = req.body;
-  
+  let { userId, channelId } = req.body;
+
   if (!userId) {
     return res.status(400).json({ success: false, error: 'userId は必須です' });
   }
-  
-  if (!conversations[userId]) {
+
+  if (!channelId) {
+    if (lineChannels.length === 1) {
+      channelId = lineChannels[0].id;
+    } else {
+      return res.status(400).json({ success: false, error: 'channelId は必須です' });
+    }
+  }
+
+  const conversationKey = getConversationKey(channelId, userId);
+  const conversation = conversations[conversationKey];
+
+  if (!conversation) {
     return res.status(404).json({ success: false, error: '該当の会話が見つかりません' });
   }
-  
+
   try {
-    const c = conversations[userId];
-    if (!c.needsReply || !c.userMessage) {
+    if (!conversation.needsReply || !conversation.userMessage) {
       return res.status(400).json({ success: false, error: '未返信のメッセージがないか、返信不要の状態です' });
     }
-    
+
     const now = Date.now();
-    const reminderCount = (c.reminderCount || 0) + 1;
-    const customText = `【強制送信】${c.displayName}さんからのメッセージ「${c.userMessage.text}」への返信が必要です。`;
-    
-    await sendSlackInteractiveNotification(userId, customText, true, reminderCount);
-    
+    const reminderCount = (conversation.reminderCount || 0) + 1;
+    const customText = `【強制送信】${conversation.displayName}さんからのメッセージ「${conversation.userMessage.text}」への返信が必要です。`;
+
+    await sendSlackInteractiveNotification(conversationKey, customText, true, reminderCount);
+
     // リマインダー情報を更新
-    conversations[userId].lastReminderTime = now;
-    conversations[userId].reminderCount = reminderCount;
-    
-    return res.json({ 
-      success: true, 
+    conversation.lastReminderTime = now;
+    conversation.reminderCount = reminderCount;
+
+    return res.json({
+      success: true,
       message: 'リマインダーを強制送信しました',
       conversation: {
-        userId,
-        displayName: c.displayName,
-        text: c.userMessage.text,
-        timestamp: new Date(c.userMessage.timestamp).toISOString(),
+        conversationKey,
+        channelId: conversation.channelId,
+        channelLabel: conversation.channelLabel,
+        userId: conversation.lineUserId,
+        displayName: conversation.displayName,
+        text: conversation.userMessage.text,
+        timestamp: new Date(conversation.userMessage.timestamp).toISOString(),
         lastReminderTime: new Date(now).toISOString(),
         reminderCount
       }
