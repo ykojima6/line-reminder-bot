@@ -6,6 +6,73 @@ const axios = require('axios');
 const fs = require('fs');
 const app = express();
 
+// waterfall / nisa 用の既定メタデータ
+const PREDEFINED_CHANNEL_METADATA = {
+  waterfall: {
+    id: 'waterfall',
+    label: 'Waterfall'
+  },
+  nisa: {
+    id: 'nisa',
+    label: 'NISA'
+  }
+};
+
+let detectedPrefixedChannelPrefixes = [];
+
+function loadChannelsFromPrefixedEnv() {
+  const prefixPattern = /^([A-Z0-9_]+)_CHANNEL_ACCESS_TOKEN$/;
+  const prefixedChannels = [];
+  const detectedPrefixes = new Set();
+
+  Object.keys(process.env).forEach(key => {
+    const match = key.match(prefixPattern);
+    if (!match) return;
+    detectedPrefixes.add(match[1]);
+  });
+
+  detectedPrefixedChannelPrefixes = Array.from(detectedPrefixes);
+
+  detectedPrefixedChannelPrefixes.forEach(prefix => {
+    const accessToken = process.env[`${prefix}_CHANNEL_ACCESS_TOKEN`];
+    const channelSecret = process.env[`${prefix}_CHANNEL_SECRET`];
+
+    if (!accessToken || !channelSecret) {
+      console.warn(`警告: ${prefix}_CHANNEL_ACCESS_TOKEN または ${prefix}_CHANNEL_SECRET が不足しているため、このチャンネル設定をスキップします`);
+      return;
+    }
+
+    const normalizedPrefix = prefix.toLowerCase();
+    const predefined = PREDEFINED_CHANNEL_METADATA[normalizedPrefix] || {};
+
+    const channelId =
+      process.env[`${prefix}_CHANNEL_ID`] ||
+      predefined.id ||
+      normalizedPrefix;
+
+    const channelLabel =
+      process.env[`${prefix}_CHANNEL_LABEL`] ||
+      process.env[`${prefix}_CHANNEL_NAME`] ||
+      predefined.label ||
+      channelId;
+
+    const destination =
+      process.env[`${prefix}_DESTINATION_ID`] ||
+      process.env[`${prefix}_CHANNEL_DESTINATION`] ||
+      null;
+
+    prefixedChannels.push({
+      id: channelId,
+      label: channelLabel,
+      channelSecret,
+      destination,
+      client: new line.Client({ channelAccessToken: accessToken })
+    });
+  });
+
+  return prefixedChannels;
+}
+
 // ---------------------------------------------------
 // 1) LINE/Slackの設定＆初期化
 // ---------------------------------------------------
@@ -43,6 +110,11 @@ function initializeLineChannels() {
       console.error('エラー: LINE_CHANNEL_CONFIGS の解析に失敗しました:', error.message);
       process.exit(1);
     }
+  }
+
+  if (channels.length === 0) {
+    const prefixedChannels = loadChannelsFromPrefixedEnv();
+    channels.push(...prefixedChannels);
   }
 
   if (channels.length === 0) {
@@ -89,6 +161,7 @@ console.log('LINE_CHANNEL_ACCESS_TOKEN exists:', !!process.env.LINE_CHANNEL_ACCE
 console.log('LINE_CHANNEL_SECRET exists:', !!process.env.LINE_CHANNEL_SECRET);
 console.log('CHANNEL_ACCESS_TOKEN exists:', !!process.env.CHANNEL_ACCESS_TOKEN);
 console.log('CHANNEL_SECRET exists:', !!process.env.CHANNEL_SECRET);
+console.log('Prefixed channel prefixes:', detectedPrefixedChannelPrefixes);
 console.log('SLACK_WEBHOOK_URL exists:', !!SLACK_WEBHOOK_URL);
 console.log('APP_BASE_URL:', APP_BASE_URL);
 console.log('登録済みLINEチャンネル:', lineChannels.map(channel => `${channel.id} (${channel.label})`));
