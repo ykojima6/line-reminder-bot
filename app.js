@@ -46,22 +46,27 @@ function initializeLineChannels() {
   }
 
   if (channels.length === 0) {
-    const channelAccessToken = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-    const channelSecret = process.env.LINE_CHANNEL_SECRET;
+    const channelAccessToken = process.env.LINE_CHANNEL_ACCESS_TOKEN || process.env.CHANNEL_ACCESS_TOKEN;
+    const channelSecret = process.env.LINE_CHANNEL_SECRET || process.env.CHANNEL_SECRET;
 
     if (!channelAccessToken || !channelSecret) {
       console.error('エラー: LINE_CHANNEL_ACCESS_TOKEN または LINE_CHANNEL_SECRET が設定されていません');
       process.exit(1);
     }
 
-    const channelId = process.env.LINE_PRIMARY_CHANNEL_ID || 'default';
-    const channelLabel = process.env.LINE_CHANNEL_LABEL || process.env.LINE_CHANNEL_NAME || channelId;
+    const channelId = process.env.LINE_PRIMARY_CHANNEL_ID || process.env.CHANNEL_ID || 'default';
+    const channelLabel =
+      process.env.LINE_CHANNEL_LABEL ||
+      process.env.LINE_CHANNEL_NAME ||
+      process.env.CHANNEL_LABEL ||
+      process.env.CHANNEL_NAME ||
+      channelId;
 
     channels.push({
       id: channelId,
       label: channelLabel,
       channelSecret,
-      destination: process.env.LINE_DESTINATION_ID || null,
+      destination: process.env.LINE_DESTINATION_ID || process.env.DESTINATION_ID || null,
       client: new line.Client({ channelAccessToken })
     });
   }
@@ -82,6 +87,8 @@ console.log('環境変数の状態:');
 console.log('LINE_CHANNEL_CONFIGS exists:', !!process.env.LINE_CHANNEL_CONFIGS);
 console.log('LINE_CHANNEL_ACCESS_TOKEN exists:', !!process.env.LINE_CHANNEL_ACCESS_TOKEN);
 console.log('LINE_CHANNEL_SECRET exists:', !!process.env.LINE_CHANNEL_SECRET);
+console.log('CHANNEL_ACCESS_TOKEN exists:', !!process.env.CHANNEL_ACCESS_TOKEN);
+console.log('CHANNEL_SECRET exists:', !!process.env.CHANNEL_SECRET);
 console.log('SLACK_WEBHOOK_URL exists:', !!SLACK_WEBHOOK_URL);
 console.log('APP_BASE_URL:', APP_BASE_URL);
 console.log('登録済みLINEチャンネル:', lineChannels.map(channel => `${channel.id} (${channel.label})`));
