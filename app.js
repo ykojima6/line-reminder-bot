@@ -18,6 +18,8 @@ const PREDEFINED_CHANNEL_METADATA = {
   }
 };
 
+const BUILTIN_CHANNEL_PREFIXES = ['WATERFALL', 'NISA'];
+
 let detectedPrefixedChannelPrefixes = [];
 
 function loadChannelsFromPrefixedEnv() {
@@ -165,6 +167,52 @@ console.log('Prefixed channel prefixes:', detectedPrefixedChannelPrefixes);
 console.log('SLACK_WEBHOOK_URL exists:', !!SLACK_WEBHOOK_URL);
 console.log('APP_BASE_URL:', APP_BASE_URL);
 console.log('登録済みLINEチャンネル:', lineChannels.map(channel => `${channel.id} (${channel.label})`));
+
+function logEnvironmentSetupGuidance() {
+  console.log('--- LINE Bot 環境変数セットアップガイド ---');
+
+  if (process.env.LINE_CHANNEL_CONFIGS) {
+    console.log('* LINE_CHANNEL_CONFIGS に JSON 配列で以下のキーを含めてください:');
+    console.log('  - channelAccessToken (必須)');
+    console.log('  - channelSecret (必須)');
+    console.log('  - id / channelId (任意、Slack表示や会話管理用)');
+    console.log('  - label / name (任意、Slack通知の見出し)');
+    console.log('  - destination / botUserId (任意、LINEのdestinationが既知の場合)');
+  } else {
+    const prefixes = new Set(detectedPrefixedChannelPrefixes);
+    BUILTIN_CHANNEL_PREFIXES.forEach(prefix => prefixes.add(prefix));
+
+    if (prefixes.size > 0) {
+      console.log('* 複数チャンネルをプレフィックス付き環境変数で設定する場合:');
+      prefixes.forEach(prefix => {
+        const lower = prefix.toLowerCase();
+        const predefined = PREDEFINED_CHANNEL_METADATA[lower];
+        const defaultId = predefined ? predefined.id : lower;
+        const defaultLabel = predefined ? predefined.label : defaultId;
+        console.log(`  - ${prefix}_CHANNEL_ACCESS_TOKEN (必須)`);
+        console.log(`  - ${prefix}_CHANNEL_SECRET (必須)`);
+        console.log(`  - ${prefix}_CHANNEL_ID (任意、デフォルト: ${defaultId})`);
+        console.log(`  - ${prefix}_CHANNEL_LABEL または ${prefix}_CHANNEL_NAME (任意、デフォルト: ${defaultLabel})`);
+        console.log(`  - ${prefix}_DESTINATION_ID または ${prefix}_CHANNEL_DESTINATION (任意)`);
+      });
+    }
+
+    console.log('* シングルチャンネルのみの場合に設定するキー:');
+    console.log('  - LINE_CHANNEL_ACCESS_TOKEN (必須)');
+    console.log('  - LINE_CHANNEL_SECRET (必須)');
+    console.log('  - LINE_PRIMARY_CHANNEL_ID (任意、既定: "default")');
+    console.log('  - LINE_CHANNEL_LABEL / LINE_CHANNEL_NAME (任意)');
+    console.log('  - LINE_DESTINATION_ID (任意)');
+    console.log('  ※ 旧名称 CHANNEL_* も読み込み対象ですが、新しいキー名を推奨します。');
+  }
+
+  console.log('* Slack / Webhook 関連:');
+  console.log('  - SLACK_WEBHOOK_URL (未設定の場合はSlack通知なし)');
+  console.log('  - APP_BASE_URL (任意、HerokuのURLなどボタンリンクに使用)');
+  console.log('---------------------------------------------');
+}
+
+logEnvironmentSetupGuidance();
 
 // ---------------------------------------------------
 // 2) 会話状態管理
