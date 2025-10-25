@@ -214,6 +214,68 @@ function logEnvironmentSetupGuidance() {
 
 logEnvironmentSetupGuidance();
 
+function printEnvironmentChecklist() {
+  const checkbox = (name, optional = false, note = '') => {
+    const exists = !!process.env[name];
+    const status = exists ? '✅' : '⬜️';
+    const requirement = optional ? '(任意)' : '(必須)';
+    const suffix = note ? ` - ${note}` : '';
+    console.log(`  ${status} ${name} ${requirement}${suffix}`);
+  };
+
+  console.log('--- Heroku Config Vars チェックリスト ---');
+
+  if (process.env.LINE_CHANNEL_CONFIGS) {
+    console.log('[複数チャンネル: LINE_CHANNEL_CONFIGS 使用]');
+    checkbox('LINE_CHANNEL_CONFIGS', false, '配列JSON (channelAccessToken, channelSecret など)');
+  } else {
+    console.log('[複数チャンネル: プレフィックス付き環境変数]');
+    const prefixes = new Set(detectedPrefixedChannelPrefixes);
+    BUILTIN_CHANNEL_PREFIXES.forEach(prefix => prefixes.add(prefix));
+
+    if (prefixes.size === 0) {
+      console.log('  (検出されたプレフィックスはありません。必要に応じて追加してください)');
+    }
+
+    prefixes.forEach(prefix => {
+      const lower = prefix.toLowerCase();
+      const predefined = PREDEFINED_CHANNEL_METADATA[lower];
+      const defaultId = predefined ? predefined.id : lower;
+      const defaultLabel = predefined ? predefined.label : defaultId;
+      console.log(`- ${prefix} チャンネル`);
+      checkbox(`${prefix}_CHANNEL_ACCESS_TOKEN`);
+      checkbox(`${prefix}_CHANNEL_SECRET`);
+      checkbox(`${prefix}_CHANNEL_ID`, true, `省略時は "${defaultId}"`);
+      checkbox(`${prefix}_CHANNEL_LABEL`, true, `省略時は "${defaultLabel}"`);
+      checkbox(`${prefix}_CHANNEL_NAME`, true, 'LABEL の代替キー');
+      checkbox(`${prefix}_DESTINATION_ID`, true);
+      checkbox(`${prefix}_CHANNEL_DESTINATION`, true, 'DESTINATION_ID の代替キー');
+    });
+
+    console.log('[単一チャンネル構成のフォールバック]');
+    checkbox('LINE_CHANNEL_ACCESS_TOKEN');
+    checkbox('LINE_CHANNEL_SECRET');
+    checkbox('LINE_PRIMARY_CHANNEL_ID', true, '省略時は "default"');
+    checkbox('LINE_CHANNEL_LABEL', true);
+    checkbox('LINE_CHANNEL_NAME', true, 'LABEL の代替キー');
+    checkbox('LINE_DESTINATION_ID', true);
+    checkbox('CHANNEL_ACCESS_TOKEN', true, '旧キー名');
+    checkbox('CHANNEL_SECRET', true, '旧キー名');
+    checkbox('CHANNEL_ID', true, '旧キー名');
+    checkbox('CHANNEL_LABEL', true, '旧キー名');
+    checkbox('CHANNEL_NAME', true, '旧キー名');
+    checkbox('DESTINATION_ID', true, '旧キー名');
+  }
+
+  console.log('[Slack / Web 設定]');
+  checkbox('SLACK_WEBHOOK_URL', false, 'Slack通知を有効化');
+  checkbox('APP_BASE_URL', true, '既定値: https://<heroku-app>.herokuapp.com');
+
+  console.log('---------------------------------------------');
+}
+
+printEnvironmentChecklist();
+
 // ---------------------------------------------------
 // 2) 会話状態管理
 // ---------------------------------------------------
